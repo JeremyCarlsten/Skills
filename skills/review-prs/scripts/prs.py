@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Helper for the review-prs skill. Wraps the `gh` CLI so every pass is consistent.
 
-Data (JSON) lives in a .jeremy folder, which is git-ignored globally:
-  - run from inside a clone of the repo: <repo root>/.jeremy/review-prs/
-  - anywhere else:                       ~/.jeremy/review-prs/<owner>__<repo>/
+Data (JSON) lives in a .skills-local folder, which is git-ignored globally:
+  - run from inside a clone of the repo: <repo root>/.skills-local/review-prs/
+  - anywhere else:                       ~/.skills-local/review-prs/<owner>__<repo>/
   (override with REVIEW_PRS_HOME)
 
   state.json        what has been reviewed (head SHA) and which comments were handled
@@ -11,7 +11,7 @@ Data (JSON) lives in a .jeremy folder, which is git-ignored globally:
   findings.jsonl    every labelled comment, for trends
   work/pr-N/        what fetch pulled for each PR
 
-Code checkouts live outside any repo, in ~/.jeremy/cache/<owner>__<repo>/ (override
+Code checkouts live outside any repo, in ~/.skills-local/cache/<owner>__<repo>/ (override
 with REVIEW_PRS_CACHE), so test runners and linters in your project never see them:
   clone/            a partial clone used to read code at the PR's commit
   wt/pr-N/          a worktree checked out at the PR head
@@ -81,7 +81,7 @@ _HOMES = {}
 
 
 def ensure_global_ignore():
-    """Make sure `.jeremy/` is in the user's global gitignore. Idempotent."""
+    """Make sure `.skills-local/` is in the user's global gitignore. Idempotent."""
     path = run(["git", "config", "--global", "--get", "core.excludesFile"], check=False).strip()
     if path:
         f = Path(os.path.expanduser(path))
@@ -90,10 +90,10 @@ def ensure_global_ignore():
         xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
         f = Path(xdg) / "git" / "ignore"
     text = f.read_text(encoding="utf-8") if f.exists() else ""
-    if not re.search(r"^/?\.jeremy/?\s*$", text, re.M):
+    if not re.search(r"^/?\.skills-local/?\s*$", text, re.M):
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".jeremy/\n", encoding="utf-8")
-        print(f"review-prs: added .jeremy/ to your global gitignore ({f})", file=sys.stderr)
+        f.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".skills-local/\n", encoding="utf-8")
+        print(f"review-prs: added .skills-local/ to your global gitignore ({f})", file=sys.stderr)
     return f
 
 
@@ -107,7 +107,7 @@ def repo_root_for(repo):
 
 
 def home(repo):
-    """Where this repo's JSON lives. Inside the repo's own .jeremy folder when run from a clone."""
+    """Where this repo's JSON lives. Inside the repo's own .skills-local folder when run from a clone."""
     if repo in _HOMES:
         return _HOMES[repo]
     if os.environ.get("REVIEW_PRS_HOME"):
@@ -117,13 +117,13 @@ def home(repo):
         if root:
             ensure_global_ignore()
             # belt and braces: also ignore it in this clone, in case a repo rule un-ignores it
-            if subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".jeremy/x"]).returncode != 0:
+            if subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".skills-local/x"]).returncode != 0:
                 excl = root / ".git" / "info" / "exclude"
                 if excl.parent.exists():
-                    excl.write_text((excl.read_text(encoding="utf-8") if excl.exists() else "") + "\n.jeremy/\n", encoding="utf-8")
-            d = root / ".jeremy" / "review-prs"
+                    excl.write_text((excl.read_text(encoding="utf-8") if excl.exists() else "") + "\n.skills-local/\n", encoding="utf-8")
+            d = root / ".skills-local" / "review-prs"
         else:
-            d = Path.home() / ".jeremy" / "review-prs" / repo.replace("/", "__")
+            d = Path.home() / ".skills-local" / "review-prs" / repo.replace("/", "__")
     (d / "drafts").mkdir(parents=True, exist_ok=True)
     migrate_old_state(repo, d)
     _HOMES[repo] = d
@@ -132,16 +132,20 @@ def home(repo):
 
 def cache(repo):
     """Where clones and worktrees live: never inside a project, so tools there don't pick them up."""
-    base = Path(os.environ.get("REVIEW_PRS_CACHE", Path.home() / ".jeremy" / "cache"))
+    base = Path(os.environ.get("REVIEW_PRS_CACHE", Path.home() / ".skills-local" / "cache"))
     d = base / repo.replace("/", "__")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def migrate_old_state(repo, d):
-    """One-time move of JSON from the old ~/.review-prs location."""
-    old = Path.home() / ".review-prs" / repo.replace("/", "__")
-    if not (old / "state.json").exists() or (d / "state.json").exists():
+    """One-time move of JSON from older locations (~/.review-prs, .jeremy)."""
+    slug = repo.replace("/", "__")
+    candidates = [Path.home() / ".review-prs" / slug, Path.home() / ".jeremy" / "review-prs" / slug]
+    if d.parent.name == ".skills-local":
+        candidates.insert(0, d.parent.parent / ".jeremy" / "review-prs")
+    old = next((c for c in candidates if (c / "state.json").exists()), None)
+    if old is None or (d / "state.json").exists():
         return
     import shutil
     for name in ("state.json", "findings.jsonl", "factory-notes.md"):
