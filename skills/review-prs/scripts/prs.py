@@ -17,6 +17,7 @@ Subcommands
   stage REPO N|all [--dry-run]  put drafts on GitHub as your pending (unsubmitted) review
   post  REPO N|all [--dry-run] [--only review|replies]   post approved drafts (submits staged ones)
   digest REPO                  one line per pending draft: door, blast radius, score
+  report REPO [N]              your local read on each PR: overall take + Merge Danger (never posted)
   path  REPO                    print the state directory
 
 Stdlib only. Requires `gh` (authenticated) and `git`.
@@ -35,7 +36,7 @@ BOT_RE = re.compile(r"(\[bot\]$|^dependabot|^renovate|-bot$)", re.I)
 
 # ---------------------------------------------------------------- helpers
 def run(cmd, check=True, cwd=None, input_text=None):
-    p = subprocess.run(cmd, cwd=cwd, input=input_text, capture_output=True, text=True)
+    p = subprocess.run(cmd, cwd=cwd, input=input_text, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and p.returncode != 0:
         sys.exit(f"command failed: {' '.join(cmd)}\n{p.stderr.strip()}")
     return p.stdout
@@ -74,12 +75,12 @@ def home(repo):
 def load_state(repo):
     f = home(repo) / "state.json"
     if f.exists():
-        return json.loads(f.read_text())
+        return json.loads(f.read_text(encoding="utf-8"))
     return {"repo": repo, "me": None, "prs": {}}
 
 
 def save_state(repo, state):
-    (home(repo) / "state.json").write_text(json.dumps(state, indent=2))
+    (home(repo) / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def me(state):
@@ -94,7 +95,7 @@ def draft_file(repo, n):
 
 def load_draft(repo, n):
     f = draft_file(repo, n)
-    return json.loads(f.read_text()) if f.exists() else None
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
 
 
 # ---------------------------------------------------------------- comments
@@ -276,17 +277,17 @@ def cmd_fetch(a):
     pr = gh_json(["pr", "view", str(n), "-R", repo, "--json",
                   "number,title,body,author,url,baseRefName,headRefName,headRefOid,baseRefOid,"
                   "files,closingIssuesReferences,labels,isDraft"])
-    (work / "pr.json").write_text(json.dumps(pr, indent=2))
-    (work / "diff.patch").write_text(run(["gh", "pr", "diff", str(n), "-R", repo]))
+    (work / "pr.json").write_text(json.dumps(pr, indent=2), encoding="utf-8")
+    (work / "diff.patch").write_text(run(["gh", "pr", "diff", str(n), "-R", repo]), encoding="utf-8")
 
     ic = gh_paged(f"repos/{repo}/issues/{n}/comments")
     rc = gh_paged(f"repos/{repo}/pulls/{n}/comments")
     rv = gh_paged(f"repos/{repo}/pulls/{n}/reviews")
-    (work / "comments.json").write_text(json.dumps({"issue_comments": ic, "review_comments": rc, "reviews": rv}, indent=2))
+    (work / "comments.json").write_text(json.dumps({"issue_comments": ic, "review_comments": rc, "reviews": rv}, indent=2), encoding="utf-8")
 
     st = state["prs"].get(str(n), {})
     waiting = comments_needing_reply(pr["author"]["login"], login, ic, rc, set(st.get("seen_comment_ids", [])))
-    (work / "waiting.json").write_text(json.dumps(waiting, indent=2))
+    (work / "waiting.json").write_text(json.dumps(waiting, indent=2), encoding="utf-8")
 
     # linked issues (the spec)
     issues = []
@@ -294,7 +295,7 @@ def cmd_fetch(a):
         num = ref.get("number")
         if num:
             issues.append(gh_json(["issue", "view", str(num), "-R", repo, "--json", "number,title,body,url"]))
-    (work / "issues.json").write_text(json.dumps(issues, indent=2))
+    (work / "issues.json").write_text(json.dumps(issues, indent=2), encoding="utf-8")
 
     # stack context: the layers below and above this one
     stack = None
@@ -316,11 +317,11 @@ def cmd_fetch(a):
                      "head": q["headRefName"], "body": q["body"]}
             if num != n:
                 f = sdir / f"pr-{num}.diff"
-                f.write_text(run(["gh", "pr", "diff", str(num), "-R", repo], check=False))
+                f.write_text(run(["gh", "pr", "diff", str(num), "-R", repo], check=False), encoding="utf-8")
                 layer["diff"] = str(f)
             layers.append(layer)
         stack = {**sm[n], "layers": layers}
-        (work / "stack.json").write_text(json.dumps(stack, indent=2))
+        (work / "stack.json").write_text(json.dumps(stack, indent=2), encoding="utf-8")
 
     # code at the PR head, in a worktree that is ours alone
     worktree = None
@@ -341,7 +342,7 @@ def cmd_fetch(a):
             ok = subprocess.run(["git", "-C", str(clone), "merge-base", "--is-ancestor", prev, pr["headRefOid"]],
                                 capture_output=True).returncode == 0
             if ok:
-                (work / "incremental.patch").write_text(run(["git", "-C", str(clone), "diff", prev, pr["headRefOid"]]))
+                (work / "incremental.patch").write_text(run(["git", "-C", str(clone), "diff", prev, pr["headRefOid"]]), encoding="utf-8")
                 incremental = str(work / "incremental.patch")
 
     prev_draft = draft_file(repo, n)
@@ -368,7 +369,7 @@ def cmd_mark(a):
         st["reviewed_sha"] = a.sha
         diff = home(a.repo) / "work" / f"pr-{a.number}" / "diff.patch"
         if diff.exists():
-            st["patch_id"] = patch_id(diff.read_text())
+            st["patch_id"] = patch_id(diff.read_text(encoding="utf-8"))
     seen = set(st.get("seen_comment_ids", []))
     seen.update(int(c) for c in a.comments or [])
     st["seen_comment_ids"] = sorted(seen)
@@ -379,6 +380,26 @@ def cmd_mark(a):
 
 # ---------------------------------------------------------------- show
 DOORS = {"one-way", "two-way"}
+LABELS = {"❌": "blocking", "💡": "suggestion", "❓": "question", "⛏": "nitpick"}  # ⛏ may carry U+FE0F
+
+
+def label_of(body):
+    b = (body or "").lstrip()
+    for e in LABELS:
+        if b.startswith(e):
+            return e
+    return None
+
+
+def label_counts(d):
+    cs = (d.get("review") or {}).get("comments", [])
+    counts = {e: 0 for e in LABELS}
+    for c in cs:
+        e = label_of(c.get("body"))
+        if e:
+            counts[e] += 1
+    shown = " ".join(f"{'⛏️' if e == '⛏' else e}{n}" for e, n in counts.items() if n)
+    return shown or "no comments"
 
 
 def merge_danger_block(a):
@@ -395,11 +416,28 @@ def merge_danger_block(a):
     return "\n".join(lines)
 
 
-def review_body(d):
+def local_report(d):
+    """Jeremy's read: the posted summary, the private take and the Merge Danger call.
+    The Merge Danger call and private take are never posted to GitHub."""
     r = d.get("review") or {}
-    body = (r.get("body") or "").strip()
+    parts = []
+    if (r.get("body") or "").strip():
+        parts.append("Summary (posted): " + r["body"].strip())
+    if (r.get("private_take") or "").strip():
+        parts.append("Private take: " + r["private_take"].strip())
     block = merge_danger_block(d.get("assessment"))
-    return f"{body}\n\n{block}".strip() if block else body
+    if block:
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+def has_inline(d):
+    """Something in the review that goes on GitHub: inline comments or a summary."""
+    r = d.get("review") or {}
+    return bool(r.get("comments") or (r.get("body") or "").strip())
+
+
+LEAK_RE = re.compile(r"rubber\s*stamp|\bdoor\b\s*:|blast\s+radius|one-way door|two-way door", re.I)
 
 
 def assessment_problems(d):
@@ -430,7 +468,8 @@ def render(d):
     lines.append("")
     r = d.get("review")
     if r:
-        lines += ["### Review (posted as a plain comment review)", "", review_body(d), ""]
+        lines += ["### Your read on this PR (local only, not posted)", "", local_report(d), ""]
+        lines += ["### Inline comments (these go on the PR)" if r.get("comments") else "### No inline comments", ""]
         for c in r.get("comments", []):
             rng = f"{c['start_line']}-{c['line']}" if c.get("start_line") else str(c["line"])
             lines += [f"**{c['path']}:{rng}**", "", c["body"].strip(), ""]
@@ -448,7 +487,7 @@ def cmd_show(a):
     drafts = sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:]))
     shown = 0
     for f in drafts:
-        d = json.loads(f.read_text())
+        d = json.loads(f.read_text(encoding="utf-8"))
         if a.number and d["pr"] != a.number:
             continue
         if not a.number and d.get("status") not in ("pending", "staged"):
@@ -467,10 +506,16 @@ def voice_problems(d):
     texts = []
     r = d.get("review")
     if r:
-        texts.append(("review summary", review_body(d)))
+        texts.append(("review summary", r.get("body", "")))
         texts += [(f"comment on {c.get('path')}:{c.get('line')}", c.get("body", "")) for c in r.get("comments", [])]
     texts += [(f"reply to @{x.get('to', '?')}", x.get("body", "")) for x in d.get("replies", []) if not x.get("posted")]
-    return [f"{where} has an em dash" for where, t in texts if DASH_RE.search(t or "")]
+    out = [f"{where} has an em dash" for where, t in texts if DASH_RE.search(t or "")]
+    out += [f"{where} mentions the Merge Danger call (door, blast radius or rubberstampability stay local)"
+            for where, t in texts if LEAK_RE.search(t or "")]
+    for c in (r or {}).get("comments", []):
+        if not label_of(c.get("body")):
+            out.append(f"comment on {c.get('path')}:{c.get('line')} doesn't start with ❌ 💡 ❓ or ⛏️")
+    return out
 
 
 def reanchor(repo, n, d, head):
@@ -508,7 +553,7 @@ def resolve_commit(repo, n, d, done):
 
 def review_payload(d, commit, event):
     r = d.get("review") or {}
-    payload = {"commit_id": commit, "body": review_body(d),
+    payload = {"commit_id": commit, **({"body": r["body"].strip()} if (r.get("body") or "").strip() else {}),
                "comments": [{k: v for k, v in c.items() if k in ("path", "line", "start_line", "side", "start_side", "body")}
                             for c in r.get("comments", [])]}
     for c in payload["comments"]:
@@ -540,7 +585,7 @@ def thread_id_for(repo, n, root_comment_id):
 def reconcile_staged(repo, n, d):
     """A staged draft's review lives on GitHub as PENDING until Jeremy submits or discards it."""
     rid = d.get("staged_review_id")
-    p = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{n}/reviews/{rid}"], capture_output=True, text=True)
+    p = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{n}/reviews/{rid}"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         d["status"] = "discarded"
     else:
@@ -557,7 +602,7 @@ def reconcile_staged(repo, n, d):
             if not left:
                 d["posted_at"] = now()
     if d["status"] != "staged":
-        draft_file(repo, n).write_text(json.dumps(d, indent=2))
+        draft_file(repo, n).write_text(json.dumps(d, indent=2), encoding="utf-8")
         st = load_state(repo)
         st["prs"].get(str(n), {}).pop("staged_review_id", None)
         save_state(repo, st)
@@ -575,8 +620,8 @@ def stage_one(repo, n, dry):
         return f"PR #{n}: NOT staged, fix the draft first: " + "; ".join(problems)
     thread_replies = [x for x in d.get("replies", []) if x["kind"] == "review_comment" and not x.get("posted")]
     convo_replies = [x for x in d.get("replies", []) if x["kind"] == "issue_comment" and not x.get("posted")]
-    if not d.get("review") and not thread_replies:
-        return f"PR #{n}: nothing that can wait on GitHub" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
+    if not has_inline(d) and not thread_replies:
+        return f"PR #{n}: no inline comments or thread replies to put on GitHub (your read stays local, see report)" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
     done = []
     commit = resolve_commit(repo, n, d, done)
     if not commit:
@@ -614,7 +659,7 @@ def stage_one(repo, n, dry):
     d.update(status="staged", staged_review_id=rv["id"], staged_url=rv.get("html_url"), staged_at=now(), staged_commit=commit)
     st["staged_review_id"] = rv["id"]
     save_state(repo, state)
-    draft_file(repo, n).write_text(json.dumps(d, indent=2))
+    draft_file(repo, n).write_text(json.dumps(d, indent=2), encoding="utf-8")
     n_c = len((d.get("review") or {}).get("comments", []))
     n_r = sum(1 for x in thread_replies if x.get("staged"))
     done.append(f"waiting on GitHub as your pending review ({n_c} comments, {n_r} thread replies): {rv.get('html_url', '')}")
@@ -624,8 +669,8 @@ def stage_one(repo, n, dry):
 
 
 def cmd_stage(a):
-    nums = ([json.loads(f.read_text())["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
-             if json.loads(f.read_text()).get("status") == "pending"]
+    nums = ([json.loads(f.read_text(encoding="utf-8"))["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
+             if json.loads(f.read_text(encoding="utf-8")).get("status") == "pending"]
             if a.target == "all" else [int(x) for x in a.target.split(",")])
     for n in sorted(nums):
         print(stage_one(a.repo, n, a.dry_run))
@@ -650,6 +695,8 @@ def post_one(repo, n, dry, only):
         calls.append(("staged", ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews/{d['staged_review_id']}/events",
                                  "--input", "-"], json.dumps({"event": "COMMENT"})))
         r = None
+    if r and not r.get("posted") and not has_inline(d):
+        r["posted"] = True  # the summary is local only; nothing to send
     if r and not r.get("posted") and only in (None, "review"):
         commit = resolve_commit(repo, n, d, done)
         if commit:
@@ -668,7 +715,21 @@ def post_one(repo, n, dry, only):
         if dry:
             done.append(f"DRY RUN: {' '.join(cmd)}  <<< {body[:200]}")
             continue
-        run(cmd, input_text=body)
+        res = subprocess.run(cmd, input=body, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if res.returncode != 0:
+            if what == "review":
+                # GitHub may insist on a review summary. We don't post one, so send the
+                # inline comments one by one instead (single comments need no summary).
+                pl = json.loads(body)
+                for c in pl["comments"]:
+                    run(["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/comments", "--input", "-"],
+                        input_text=json.dumps({"commit_id": pl["commit_id"], **c}))
+            elif what == "staged":
+                done.append(f"couldn't submit the pending review from here ({res.stderr.strip()[:120]}); "
+                            f"open {d.get('staged_url', 'the PR')} and click Finish your review")
+                continue
+            else:
+                sys.exit(f"command failed: {' '.join(cmd)}\n{res.stderr.strip()}")
         if what == "review":
             r["posted"] = True
             done.append("review posted")
@@ -688,14 +749,14 @@ def post_one(repo, n, dry, only):
             d["status"] = "posted"
             load = load_state(repo); load["prs"].get(str(n), {}).pop("staged_review_id", None); save_state(repo, load)
             d["posted_at"] = now()
-        draft_file(repo, n).write_text(json.dumps(d, indent=2))
+        draft_file(repo, n).write_text(json.dumps(d, indent=2), encoding="utf-8")
     return f"PR #{n}: " + ("; ".join(done) if done else "nothing to post")
 
 
 def cmd_post(a):
     if a.target == "all":
-        nums = [json.loads(f.read_text())["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
-                if json.loads(f.read_text()).get("status") in ("pending", "staged")]
+        nums = [json.loads(f.read_text(encoding="utf-8"))["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
+                if json.loads(f.read_text(encoding="utf-8")).get("status") in ("pending", "staged")]
     else:
         nums = [int(x) for x in a.target.split(",")]
     for n in sorted(nums):
@@ -705,18 +766,17 @@ def cmd_post(a):
 def cmd_digest(a):
     rows = []
     for f in sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:])):
-        d = json.loads(f.read_text())
+        d = json.loads(f.read_text(encoding="utf-8"))
         if d.get("status") not in ("pending", "staged"):
             continue
         asm = d.get("assessment") or {}
         r = d.get("review") or {}
         cs = r.get("comments", [])
-        nits = sum(1 for c in cs if (c.get("body") or "").lstrip().lower().startswith("nit"))
         parts = []
         if asm:
             parts.append(f"{asm.get('door', '?')} · {asm.get('blast_radius', '?')} · {asm.get('rubberstamp', '?')}/5")
         if r:
-            parts.append(f"{len(cs) - nits} must-fix, {nits} nits")
+            parts.append(label_counts(d))
         if d.get("replies"):
             parts.append(f"{len(d['replies'])} replies")
         if d.get("status") == "staged":
@@ -752,7 +812,37 @@ def cmd_digest(a):
         print("Stack  " + "  ·  ".join(bits))
 
 
+def cmd_report(a):
+    """Jeremy's local read: overall take + Merge Danger for each draft, riskiest first."""
+    items = []
+    for f in (home(a.repo) / "drafts").glob("pr-*.json"):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        if a.number and d["pr"] != a.number:
+            continue
+        if not a.number and d.get("status") not in ("pending", "staged"):
+            continue
+        if not d.get("review"):
+            continue
+        items.append(((d.get("assessment") or {}).get("rubberstamp", 9), d))
+    if not items:
+        print("No reviews to report."); return
+    for _, d in sorted(items, key=lambda x: (x[0], x[1]["pr"])):
+        cs = d["review"].get("comments", [])
+        where = "pending on GitHub" if d.get("status") == "staged" else d.get("status")
+        print(f"## #{d['pr']} {d.get('title', '')}  ({label_counts(d)}; {where})\n")
+        print(local_report(d))
+        if d.get("notes_for_me"):
+            print(f"\nNotes: {d['notes_for_me'].strip()}")
+        print("\n---\n")
+
+
 def main():
+    # Windows consoles and pipes default to a legacy code page; drafts carry emoji.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("scan"); s.add_argument("repo"); s.add_argument("--include-drafts", action="store_true"); s.add_argument("--include-bots", action="store_true"); s.add_argument("--include-own", action="store_true", help="also review PRs you opened")
@@ -763,12 +853,13 @@ def main():
     s.add_argument("--dry-run", action="store_true"); s.add_argument("--only", choices=["review", "replies"])
     s = sub.add_parser("stage"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
     s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("report"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
     s = sub.add_parser("path"); s.add_argument("repo")
     s = sub.add_parser("digest"); s.add_argument("repo")
     a = ap.parse_args()
     if a.cmd == "path":
         print(home(a.repo)); return
-    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage}[a.cmd](a)
+    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -33,9 +33,9 @@ The same rules hold when Jeremy is the reviewer rather than the one replying:
 - Lead with the problem or the ask, then the practical reason. "This returns `[]` when `customerId` is missing, so a bad request looks like a customer with no invoices. I'd return a 400."
 - One point per inline comment, usually one to three sentences. A short code suggestion is fine when it says it faster than words.
 - Say what breaks or what it costs, not the principle's name. Not "violates SRP" but "this handler does the lookup, the formatting and the email, so testing any one of them means setting up all three."
-- Mark optional stuff as optional in plain words ("Not a big deal, but..." or "nit:") so people know they can skip it.
-- The review summary is a couple of sentences: the overall take and the one or two things that matter most. No headers, no bullet walls.
-- If the PR is fine, say so briefly. "Looks good to me." is a complete review.
+- Start every inline comment with one label emoji: ❌ blocking, 💡 suggestion (non-blocking), ❓ question, ⛏️ nitpick. The emoji says how much it matters, so the words don't need to ("Not a big deal, but..." is redundant after ⛏️).
+- The review summary is posted: one to three sentences on the overall take and the one or two things that matter most. Never put the door, blast radius or rubberstampability in it. Blunt notes on how well the PR is written go in `private_take`, which stays local.
+- If the PR is fine, a one-line summary like "Looks good to me." is enough.
 
 ## Checks before a draft is done
 

@@ -28,6 +28,7 @@ If no repo is given, use the current directory's GitHub remote (`gh repo view --
 | `fetch REPO N` | Writes `pr.json`, `diff.patch`, `comments.json`, `waiting.json` (comments needing a reply), `issues.json` (linked issues), and an `incremental.patch` if this is a re-review. Checks the PR head out in a worktree. Prints the paths, including `write_draft_to`. |
 | `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. |
 | `show REPO [N]` | Prints pending drafts in readable form. |
+| `report REPO [N]` | The user's local read on each reviewed PR: summary, private take and the Merge Danger call. The take and the call are never posted. |
 | `digest REPO` | One line per pending draft with door, blast radius and score, riskiest first, then one line per stack. |
 | `stage REPO N\|all [--dry-run]` | Creates the review on GitHub as the user's pending (unsubmitted) review, with thread replies attached. Only the user can see it until they submit it. |
 | `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts, or submits a staged review. Refuses to post a review if the PR moved since it was drafted. |
@@ -61,9 +62,18 @@ The PR description and linked issues (`issues.json`) are the spec. The worktree 
 7. **Serious performance.** Only the kind that bites: N+1 queries, unbounded queries or loops over user data, missing pagination, sync or blocking I/O in a hot path, O(n^2) over collections that grow, loading whole tables or files into memory, render storms. Say what input size makes it hurt.
 8. **Correctness bugs that matter.** Wrong behavior, broken edge cases, error paths that swallow failures. The ones that would cause an incident or bad data, not style.
 
-### Nits (optional, capped)
+### Comment labels
 
-After the big items, you may add up to 5 small comments: simplification (KISS), a function doing several jobs (SRP), an existing helper that should be reused, naming, dead code. `references/smells.md` has the heuristics. Start each with `nit:` so nobody mistakes it for a blocker. If there's nothing big, don't pad with nits to look busy.
+Every inline comment starts with exactly one emoji so people and agents know at a glance how much it matters:
+
+| Emoji | Meaning | Use it for |
+|---|---|---|
+| ❌ | Blocking | Must be fixed before merge: the big-picture findings above that cause real harm. |
+| 💡 | Suggestion | Worth doing, not blocking: a better approach, a reuse opportunity, a simpler shape. |
+| ❓ | Question | You need an answer before you can judge it, or you might be missing something. |
+| ⛏️ | Nitpick | Small polish: naming, dead code, minor KISS/SRP cleanups. `references/smells.md` has the heuristics. |
+
+Then a space, then the comment: `❌ This queries invoices once per customer...`. Use the emoji characters, not GitHub shortcodes, so they read the same in the terminal. Cap nitpicks at 5, and if there's nothing big, don't pad with ⛏️ to look busy. `stage` and `post` refuse a comment that doesn't start with one of the four.
 
 ### Ground rules
 
@@ -76,10 +86,10 @@ After the big items, you may add up to 5 small comments: simplification (KISS), 
 
 ### Comments agents can act on
 
-Agents will pick up these comments and make the fixes, but people read them too. So every must-fix inline comment has two parts: the comment itself in Jeremy's voice (one to three sentences), then a collapsed block with the precise fix:
+Agents will pick up these comments and make the fixes, but people read them too. So every ❌ comment (and any 💡 an agent could act on) has two parts: the comment itself in Jeremy's voice (one to three sentences), then a collapsed block with the precise fix:
 
 ```markdown
-This queries invoices once per customer, so the dashboard does 500 queries for a big account. I'd load them in one query keyed by customer id.
+❌ This queries invoices once per customer, so the dashboard does 500 queries for a big account. I'd load them in one query keyed by customer id.
 
 <details><summary>Fix for an agent</summary>
 
@@ -89,7 +99,7 @@ This queries invoices once per customer, so the dashboard does 500 queries for a
 </details>
 ```
 
-The fix block can be terse and technical; it isn't held to the voice guide's sentence count, but it still uses no em dashes. Nits don't need a fix block.
+The fix block can be terse and technical; it isn't held to the voice guide's sentence count, but it still uses no em dashes. ⛏️ and ❓ comments don't need a fix block.
 
 **The user's own PRs** (`own_pr` is true, only with `--mine`): same lenses and Merge Danger call. GitHub lets you post a comment review on your own PR, so it posts the same way. Write the comments as notes to the factory and to the user rather than to a teammate: what to change and why, still in the voice guide.
 
@@ -112,7 +122,7 @@ What changes when reviewing a layer:
 
 ## Merge Danger
 
-Every review ends with a Merge Danger call, in the same shape as the `/pr` skill's PR body (Matt Pocock's skills library, credited to Dex Horthy's show-me skill), so author and reviewer speak the same language. Put it in the draft's `assessment`; the script appends it to the review body when posting.
+Every review comes with a Merge Danger call, in the same shape as the `/pr` skill's PR body (Matt Pocock's skills library, credited to Dex Horthy's show-me skill), so author and reviewer speak the same language. Put it in the draft's `assessment`. It's for the user, not the PR: it's shown locally (`report`, `show`, the digest) and never posted to GitHub. The PR body already has the author's door and blast radius; if yours differs, say so plainly in the posted summary or a ❓ comment ("This adds a migration, so I don't think it's reversible by revert") without using the Merge Danger labels or a score.
 
 **Check the author's claim first.** PRs from the factory usually carry their own `## Merge Danger` section and an `## Evidence` section in the body (`pr.json`). Read them. If your call differs from theirs (they said two-way, you see a migration), say so in the review body, because a wrong self-assessment is exactly what lets a risky PR get rubber-stamped. If the Evidence is a test that's tautological, say that too.
 
@@ -124,13 +134,13 @@ Every review ends with a Merge Danger call, in the same shape as the `/pr` skill
 
 | Score | Meaning | Typical shape |
 |---|---|---|
-| 5 | Stamp it | Two-way door, contained, matches the spec, real tests (not tautological) cover the change, no must-fix findings. |
-| 4 | Skim it | Two-way, small radius, only nits or one minor must-fix, evidence is real. |
-| 3 | Read it | Something needs a person's eyes: a real must-fix, weak or tautological tests on the logic that matters, a radius beyond one feature, or any one-way door. |
+| 5 | Stamp it | Two-way door, contained, matches the spec, real tests (not tautological) cover the change, no ❌ comments. |
+| 4 | Skim it | Two-way, small radius, only 💡, ❓ or ⛏️ comments, evidence is real. |
+| 3 | Read it | Something needs a person's eyes: a ❌ comment, weak or tautological tests on the logic that matters, a radius beyond one feature, or any one-way door. |
 | 2 | Review closely | A one-way door with open questions, or an architecture, spec or serious performance problem. |
 | 1 | Don't merge as is | A security hole, a data-loss or bad-data risk, a contradiction of the spec, or a one-way door that looks wrong. |
 
-Caps: a one-way door is never above 3, because it deserves a deliberate yes (the script enforces this). A security or spec-contradiction must-fix is never above 2. `rubberstamp_reason` is one plain sentence naming what drove the score.
+Caps: a one-way door is never above 3, because it deserves a deliberate yes (the script enforces this). A ❌ for security or a spec contradiction is never above 2. `rubberstamp_reason` is one plain sentence naming what drove the score.
 
 ## Replying to comments
 
@@ -158,7 +168,8 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
   "created_at": "<ISO time>",
   "status": "pending",
   "review": {
-    "body": "One to three sentences: the overall take, the one or two things that matter most, and whether the PR's own Merge Danger call holds up. No Merge Danger block here; the script adds it.",
+    "body": "Posted as the review summary: one to three sentences in the user's voice on the overall take and the one or two things that matter most. No door, blast radius or score; the PR body already has its own Merge Danger section.",
+    "private_take": "Local only, never posted: blunt notes for the user on how well the PR is written and whether the PR's own Merge Danger call holds up.",
     "comments": [
       { "path": "src/routes/invoices.js", "line": 9, "body": "..." },
       { "path": "src/routes/invoices.js", "start_line": 15, "line": 26, "body": "..." }
@@ -183,13 +194,14 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
 - `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment; `stage` and `post` refuse one without it.
 - Inline comment `line` numbers are lines in the PR head version of the file (RIGHT side) and must fall inside a diff hunk, or GitHub rejects the review. Check against `diff.patch`. If a point is about code outside the diff, put it in the review body instead.
 - For `review_comment` replies, `reply_to` is the thread's root comment ID (`reply_to` in `waiting.json`).
+- What goes to GitHub: the short text summary (`review.body`), the inline comments and the thread replies. What stays local: `private_take` and the whole Merge Danger call. The PR body already carries its own door and blast radius, and rubberstampability is for the user only. `stage` and `post` refuse a summary or comment that mentions door, blast radius or rubberstampability.
 - Reviews post as a plain comment review — never approve or request changes unless the user asks.
 
 Then: `mark REPO N --sha <head_sha> --comments <every id from waiting.json you handled or deliberately skipped>`.
 
 ## The digest
 
-End every pass with a short digest in the terminal. Run `digest REPO` for the pending-drafts table (riskiest first) and put your one-line notes on what's new this pass above it:
+End every pass with your local read on each PR reviewed this pass: run `report REPO N` for each and print it (the posted summary, your private take on how well the PR is written, Door, Blast Radius, Rubberstampability, notes). The private take and Merge Danger call never go on GitHub. Then the digest: run `digest REPO` for the pending-drafts table (riskiest first) and put your one-line notes on what's new this pass above it:
 
 ```
 review-prs · owner/repo · 14:32
@@ -197,8 +209,8 @@ New this pass
   #42  drafted review, PR body says two-way but it adds a migration
   #57  drafted 2 replies on your PR
 Pending drafts, riskiest first
-  #42    Add invoices endpoints        one-way · data · 2/5  ·  2 must-fix, 1 nits  ·  1 replies
-  #61    Field card spacing            two-way · contained · 5/5  ·  0 must-fix, 0 nits
+  #42    Add invoices endpoints        one-way · data · 2/5  ·  ❌2 💡1 ⛏️1  ·  1 replies
+  #61    Field card spacing            two-way · contained · 5/5  ·  no comments
   #57    Fix login redirect                                        ·  2 replies
 Stack  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
 Skipped: 3 drafts, 1 bot, 4 with nothing new, 2 rebased only
@@ -209,7 +221,7 @@ If nothing needed doing, one line: `review-prs · owner/repo · nothing new.`
 
 ## Staging on GitHub
 
-By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the summary, the inline comments and the replies to review threads all show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
+By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the short summary, the inline comments and the replies to review threads show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
 
 Things to know:
 - **Conversation replies can't be staged.** GitHub can only hold inline comments and review-thread replies as pending. Replies to top-level conversation comments stay local; `show` lists them and `post` sends them.
