@@ -15,6 +15,7 @@ Invocation:
 - `/review-prs owner/repo --local` — keep drafts on this machine only; don't stage them on GitHub.
 - `/review-prs owner/repo stage 42` · `stage all` — put drafts on GitHub as the user's pending review (see "Staging on GitHub").
 - `/review-prs owner/repo post 42` · `post 42,57` · `post all` — post approved drafts, or submit staged ones.
+- `/review-prs owner/repo approve 42` · `approve 42,57` (or "approve and post 42") — same as post, but submits the review as an approval. Only by PR number, never `all`.
 - `/review-prs owner/repo show` — print pending drafts.
 - `/review-prs owner/repo trends` — findings that keep repeating across PRs, and what to change in the factory to stop them.
 - `/review-prs owner/repo overlaps` — open PRs that touch the same files.
@@ -43,6 +44,7 @@ Where things live (`prs.py path REPO` prints both):
 | `config REPO [KEY [VALUE]]` | Shows or sets `settle_minutes` (default 15) and `review_red` (default false). |
 | `stage REPO N\|all [--dry-run]` | Creates the review on GitHub as the user's pending (unsubmitted) review, with thread replies attached. Only the user can see it until they submit it. |
 | `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts, or submits a staged review. Refuses to post a review if the PR moved since it was drafted. |
+| `approve REPO N[,N] [--dry-run]` | Same as `post`, but the review goes in as an approval (with the summary as its comment, if there is one). |
 
 Run `gh auth status` once at the start. If it fails, tell the user to run `gh auth login` and stop.
 
@@ -92,7 +94,7 @@ Then a space, then the comment: `❌ This queries invoices once per customer...`
 - The repo's own consistent conventions beat textbook advice.
 - Skip anything a linter, formatter or type checker in the repo already enforces.
 - Every finding points at a line in the diff, plus the existing code, doc or spec it's measured against. No evidence, no comment.
-- Don't repeat what another reviewer already said in `comments.json`.
+- Don't repeat what another reviewer (a person or a bot like CodeRabbit or Copilot) already said in `comments.json`. If their comment raises one of your findings, add it to the draft's `agree` list instead: that puts a 👍 on their comment, which flags it as worth looking into. Only agree with comments you checked and actually agree with, and only inline review comments or conversation comments (GitHub can't react to a review summary; mention those in `private_take`).
 - If the PR is fine, say so in one line.
 
 ### Comments agents can act on
@@ -206,6 +208,10 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
     { "kind": "issue_comment", "to": "bob", "context": "...", "body": "..." },
     { "kind": "review_comment", "reply_to": 654321, "thread_id": "PRRT_abc", "resolve": true, "to": "alice", "context": "my earlier ❌ on the N+1 query", "body": "Fixed in a1b2c3d." }
   ],
+  "agree": [
+    { "kind": "review_comment", "id": 777001, "author": "coderabbitai", "path": "src/dashboard.ts", "line": 42,
+      "why": "Same N+1 query I found.", "category": "performance", "severity": "❌" }
+  ],
   "notes_for_me": "Things for the user only: decisions to make, low-confidence findings, anything you left out and why."
 }
 ```
@@ -213,8 +219,9 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
 - `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment; `stage` and `post` refuse one without it.
 - Inline comment `line` numbers are lines in the PR head version of the file (RIGHT side) and must fall inside a diff hunk, or GitHub rejects the review. Check against `diff.patch`. If a point is about code outside the diff, put it in the review body instead.
 - For `review_comment` replies, `reply_to` is the thread's root comment ID (`reply_to` in `waiting.json`).
+- `agree` entries use the other comment's numeric `id` from `comments.json` (`review_comments` → `review_comment`, `issue_comments` → `issue_comment`). `severity` is the label you'd have given it (❌ or 💡) and `category` is one of the comment categories, so agreed findings still count in `trends`.
 - What goes to GitHub: the short text summary (`review.body`), the inline comments and the thread replies. What stays local: `private_take` and the whole Merge Danger call. The PR body already carries its own door and blast radius, and rubberstampability is for the user only. `stage` and `post` refuse a summary or comment that mentions door, blast radius or rubberstampability.
-- Reviews post as a plain comment review — never approve or request changes unless the user asks.
+- Reviews post as a plain comment review. Approve only when the user names the PR (`approve 42`, "approve and post 42"); never request changes unless they ask.
 
 Then: `mark REPO N --sha <head_sha> --comments <every id from waiting.json you handled or deliberately skipped>`.
 
@@ -232,8 +239,12 @@ New this pass
   #42    Add invoices endpoints        2/5  The migration is a one-way door and the backfill isn't in the spec.
 ✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)
   #61    Field card spacing
+💬 Summary only, no inline comments
+  #61    Field card spacing  (5/5)
+         "Looks good to me. Spacing matches the other cards."
+         -> approve 61  ·  post 61 (comment only)
 Pending drafts, riskiest first
-  #42    Add invoices endpoints        one-way · data · 2/5  ·  ❌2 💡1 ⛏️1  ·  1 replies
+  #42    Add invoices endpoints        one-way · data · 2/5  ·  ❌2 💡1 ⛏️1 👍1  ·  1 replies
   #61    Field card spacing            two-way · contained · 5/5  ·  no comments
   #57    Fix login redirect                                        ·  2 replies
 Stack  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
@@ -271,6 +282,8 @@ When the user asks for trends (or a "factory report"), run `trends REPO`, read t
 By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the short summary, the inline comments and the replies to review threads show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
 
 Things to know:
+- **👍 reactions can't be pending.** They go on when the user runs `post`/`approve`, or on the next pass after they submit the staged review on GitHub.
+- **Summary-only reviews aren't staged.** When a review has a summary but no inline comments, a pending review would just hide one sentence behind "Finish your review". It stays local and shows up in the digest's 💬 section with the summary text, so the user can say `approve 42` or `post 42` in one step.
 - **Conversation replies can't be staged.** GitHub can only hold inline comments and review-thread replies as pending. Replies to top-level conversation comments stay local; `show` lists them and `post` sends them.
 - **One pending review per person per PR.** If the user already has their own pending review going on a PR, `stage` refuses rather than touching it, and says so. Leave that draft local and mention it in the digest.
 - **Re-staging replaces.** After a re-review, `stage` deletes the earlier pending review it made and creates the new one. It never deletes a pending review it didn't make.
@@ -279,7 +292,7 @@ Things to know:
 
 ## Posting
 
-Only when the user asks (`post 42`, `post all`, "send the review on 42"). First run `post ... --dry-run` and check it's what you expect, then run it for real and report what went out. For a staged draft, `post` submits the pending review as it now stands on GitHub, including the user's edits there. For a local draft, it posts the draft file as written, including any edits the user made to it. If a review is refused because the PR moved, offer to re-review. Never submit or post during a loop pass on your own; staging is as far as a pass goes.
+Only when the user asks (`post 42`, `post all`, `approve 42`, "send the review on 42", "approve and post 42"). First run `post ... --dry-run` and check it's what you expect, then run it for real and report what went out. For a staged draft, `post` submits the pending review as it now stands on GitHub, including the user's edits there. For a local draft, it posts the draft file as written, including any edits the user made to it. If a review is refused because the PR moved, offer to re-review. GitHub doesn't allow approving your own PR; if `approve` is refused for that, say so and offer `post` instead. Never submit or post during a loop pass on your own; staging is as far as a pass goes.
 
 ## Loop mode
 

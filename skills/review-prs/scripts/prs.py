@@ -22,7 +22,8 @@ Subcommands
   mark  REPO N --sha S [--comments ID ...]   record what this pass handled
   show  REPO [N]                print pending drafts in readable form
   stage REPO N|all [--dry-run]  put drafts on GitHub as your pending (unsubmitted) review
-  post  REPO N|all [--dry-run] [--only review|replies]   post approved drafts (submits staged ones)
+  post  REPO N|all [--dry-run] [--only review|replies] [--approve]   post approved drafts (submits staged ones)
+  approve REPO N[,N] [--dry-run] same as post, but submits the review as an approval
   digest REPO                  one line per pending draft: door, blast radius, score
   report REPO [N]              your local read on each PR: overall take + Merge Danger (never posted)
   overlaps REPO [N]            open PRs that touch the same files (not counting their own stack)
@@ -617,6 +618,13 @@ def log_findings(repo, n, sha):
             out.write(json.dumps({"date": now(), "pr": n, "sha": sha, "path": c.get("path"), "line": c.get("line"),
                                   "label": label_of(c.get("body")), "category": c.get("category", "other"),
                                   "text": first[:200]}, ensure_ascii=False) + "\n")
+        for x in d.get("agree", []):
+            key = (n, sha, x.get("path"), f"agree-{x.get('id')}")
+            if key in seen:
+                continue
+            out.write(json.dumps({"date": now(), "pr": n, "sha": sha, "path": x.get("path"), "line": f"agree-{x.get('id')}",
+                                  "label": x.get("severity", "💡"), "category": x.get("category", "other"),
+                                  "text": f"(agreed with @{x.get('author', '?')}) {x.get('why', '')[:180]}"}, ensure_ascii=False) + "\n")
 
 
 def cmd_trends(a):
@@ -688,6 +696,8 @@ def label_counts(d):
         if e:
             counts[e] += 1
     shown = " ".join(f"{'⛏️' if e == '⛏' else e}{n}" for e, n in counts.items() if n)
+    if d.get("agree"):
+        shown = (shown + " " if shown else "") + f"👍{len(d['agree'])}"
     return shown or "no comments"
 
 
@@ -767,6 +777,12 @@ def render(d):
                   f"> {(rep.get('context') or '').strip()[:300]}", "", rep["body"].strip(), ""]
     if d.get("notes_for_me"):
         lines += ["### Notes for you (not posted)", "", d["notes_for_me"].strip(), ""]
+    if d.get("agree"):
+        lines += ["### 👍 Agreeing with existing comments (reaction added when you post or submit)", ""]
+        for x in d["agree"]:
+            done = " (done)" if x.get("reacted") else ""
+            lines += [f"- @{x.get('author', '?')} on {x.get('path') or 'the PR'}{':' + str(x['line']) if x.get('line') else ''}: {x.get('why', '').strip()}{done}"]
+        lines.append("")
     for p in voice_problems(d) + assessment_problems(d):
         lines.append(f"WARNING: {p} (post will refuse this draft)")
     return "\n".join(lines)
@@ -801,6 +817,9 @@ def voice_problems(d):
     out = [f"{where} has an em dash" for where, t in texts if DASH_RE.search(t or "")]
     out += [f"{where} mentions the Merge Danger call (door, blast radius or rubberstampability stay local)"
             for where, t in texts if LEAK_RE.search(t or "")]
+    for x in d.get("agree", []):
+        if x.get("kind") not in ("review_comment", "issue_comment") or not isinstance(x.get("id"), int):
+            out.append(f"agree entry for @{x.get('author', '?')} needs kind review_comment|issue_comment and a numeric id")
     for c in (r or {}).get("comments", []):
         lab = label_of(c.get("body"))
         if not lab:
@@ -874,6 +893,21 @@ def thread_id_for(repo, n, root_comment_id):
     return None
 
 
+def add_agree_reactions(repo, d, done):
+    """👍 the other reviewers' comments that already raise one of our findings."""
+    for x in d.get("agree", []):
+        if x.get("reacted"):
+            continue
+        kind = "pulls" if x.get("kind") == "review_comment" else "issues"
+        res = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/{kind}/comments/{x['id']}/reactions",
+                              "-f", "content=+1"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if res.returncode == 0:
+            x["reacted"] = True
+            done.append(f"👍 on @{x.get('author', '?')}'s comment")
+        else:
+            done.append(f"couldn't 👍 @{x.get('author', '?')}'s comment ({res.stderr.strip()[:80]})")
+
+
 def resolve_threads(repo, d, done):
     """Resolve review threads whose fix was verified (reply has resolve: true and was posted)."""
     m = "mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{id}}}"
@@ -893,7 +927,10 @@ def reconcile_staged(repo, n, d):
     if p.returncode != 0:
         d["status"] = "discarded"
     else:
-        state = json.loads(p.stdout).get("state")
+        try:
+            state = json.loads(p.stdout).get("state")
+        except ValueError:
+            return d  # couldn't tell; leave it staged and check again next time
         if state != "PENDING":
             # Submitted on GitHub. Anything that couldn't be staged (conversation replies) still waits.
             if d.get("review"):
@@ -902,6 +939,7 @@ def reconcile_staged(repo, n, d):
                 if x.get("staged"):
                     x["posted"] = True
             resolve_threads(repo, d, [])
+            add_agree_reactions(repo, d, [])
             left = [x for x in d.get("replies", []) if not x.get("posted")]
             d["status"] = "pending" if left else "posted"
             if not left:
@@ -925,8 +963,10 @@ def stage_one(repo, n, dry):
         return f"PR #{n}: NOT staged, fix the draft first: " + "; ".join(problems)
     thread_replies = [x for x in d.get("replies", []) if x["kind"] == "review_comment" and not x.get("posted")]
     convo_replies = [x for x in d.get("replies", []) if x["kind"] == "issue_comment" and not x.get("posted")]
-    if not has_inline(d) and not thread_replies:
-        return f"PR #{n}: no inline comments or thread replies to put on GitHub (your read stays local, see report)" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
+    if not (d.get("review") or {}).get("comments") and not thread_replies:
+        # A summary on its own reads better as a one-step approve or comment than as a pending review.
+        kind = "summary only, kept local for `approve` or `post`" if has_inline(d) else "nothing to put on GitHub (your read stays local, see report)"
+        return f"PR #{n}: {kind}" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
     done = []
     commit = resolve_commit(repo, n, d, done)
     if not commit:
@@ -981,7 +1021,7 @@ def cmd_stage(a):
         print(stage_one(a.repo, n, a.dry_run))
 
 
-def post_one(repo, n, dry, only):
+def post_one(repo, n, dry, only, approve=False):
     d = load_draft(repo, n)
     if not d:
         return f"PR #{n}: no draft"
@@ -989,6 +1029,7 @@ def post_one(repo, n, dry, only):
         d = reconcile_staged(repo, n, d)
     if d.get("status") not in ("pending", "staged"):
         return f"PR #{n}: draft is {d.get('status')}, nothing to post"
+    event = "APPROVE" if approve else "COMMENT"
     problems = voice_problems(d) + assessment_problems(d)
     if problems and d.get("status") == "pending":
         return f"PR #{n}: NOT posted, fix the draft first: " + "; ".join(problems)
@@ -998,14 +1039,14 @@ def post_one(repo, n, dry, only):
     if d.get("status") == "staged" and only in (None, "review"):
         # Submit the pending review exactly as it now stands on GitHub, including any edits made there.
         calls.append(("staged", ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews/{d['staged_review_id']}/events",
-                                 "--input", "-"], json.dumps({"event": "COMMENT"})))
+                                 "--input", "-"], json.dumps({"event": event})))
         r = None
-    if r and not r.get("posted") and not has_inline(d):
-        r["posted"] = True  # the summary is local only; nothing to send
+    if r and not r.get("posted") and not has_inline(d) and not approve:
+        r["posted"] = True  # nothing to send
     if r and not r.get("posted") and only in (None, "review"):
         commit = resolve_commit(repo, n, d, done)
         if commit:
-            payload = review_payload(d, commit, "COMMENT")
+            payload = review_payload(d, commit, event)
             calls.append(("review", ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews", "--input", "-"], json.dumps(payload)))
     if only in (None, "replies"):
         for rep in d.get("replies", []):
@@ -1016,12 +1057,20 @@ def post_one(repo, n, dry, only):
             else:
                 cmd = ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{n}/comments", "--input", "-"]
             calls.append((rep, cmd, json.dumps({"body": rep["body"]})))
+    if dry:
+        for x in d.get("agree", []):
+            if not x.get("reacted"):
+                done.append(f"DRY RUN: 👍 on @{x.get('author', '?')}'s {x.get('kind')} {x.get('id')}")
     for what, cmd, body in calls:
         if dry:
             done.append(f"DRY RUN: {' '.join(cmd)}  <<< {body[:200]}")
             continue
         res = subprocess.run(cmd, input=body, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if res.returncode != 0:
+            if what in ("review", "staged") and approve:
+                done.append(f"NOT approved: {res.stderr.strip()[:160]}"
+                            + (" (GitHub doesn't let you approve your own PR; use post instead)" if "own pull request" in res.stderr else ""))
+                continue
             if what == "review":
                 # GitHub may insist on a review summary. We don't post one, so send the
                 # inline comments one by one instead (single comments need no summary).
@@ -1037,20 +1086,22 @@ def post_one(repo, n, dry, only):
                 sys.exit(f"command failed: {' '.join(cmd)}\n{res.stderr.strip()}")
         if what == "review":
             r["posted"] = True
-            done.append("review posted")
+            done.append("approved" + (" with your summary" if (r.get("body") or "").strip() else "") if approve else "review posted")
         elif what == "staged":
             for x in d.get("replies", []):
                 if x.get("staged"):
                     x["posted"] = True
             d["review_submitted"] = True
-            done.append("pending review submitted")
+            done.append("pending review submitted as an approval" if approve else "pending review submitted")
         else:
             what["posted"] = True
             done.append(f"reply to @{what.get('to', '?')} posted")
     if not dry:
         resolve_threads(repo, d, done)
+        if only in (None, "review"):
+            add_agree_reactions(repo, d, done)
         review_ok = (not r or r.get("posted")) if d.get("status") != "staged" else d.get("review_submitted")
-        replies_ok = all(x.get("posted") for x in d.get("replies", []))
+        replies_ok = all(x.get("posted") for x in d.get("replies", [])) and all(x.get("reacted") for x in d.get("agree", []))
         if review_ok and replies_ok:
             d["status"] = "posted"
             load = load_state(repo); load["prs"].get(str(n), {}).pop("staged_review_id", None); save_state(repo, load)
@@ -1060,13 +1111,15 @@ def post_one(repo, n, dry, only):
 
 
 def cmd_post(a):
+    if a.target == "all" and getattr(a, "approve", False):
+        sys.exit("Approve PRs by number (approve 42,57), not 'all'.")
     if a.target == "all":
         nums = [json.loads(f.read_text(encoding="utf-8"))["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
                 if json.loads(f.read_text(encoding="utf-8")).get("status") in ("pending", "staged")]
     else:
         nums = [int(x) for x in a.target.split(",")]
     for n in sorted(nums):
-        print(post_one(a.repo, n, a.dry_run, a.only))
+        print(post_one(a.repo, n, a.dry_run, a.only, approve=getattr(a, "approve", False)))
 
 
 def cmd_digest(a):
@@ -1111,6 +1164,17 @@ def cmd_digest(a):
     if ready:
         print("✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)")
         print("\n".join(sorted(ready)) + "\n")
+    summary_only = []
+    for f in sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:])):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        r = d.get("review") or {}
+        if d.get("status") == "pending" and not r.get("posted") and not r.get("comments") and (r.get("body") or "").strip():
+            score = (d.get("assessment") or {}).get("rubberstamp", "?")
+            summary_only.append(f"  #{d['pr']:<5} {d.get('title', '')[:48]}  ({score}/5)\n         \"{r['body'].strip()}\"\n"
+                                f"         -> approve {d['pr']}  ·  post {d['pr']} (comment only)")
+    if summary_only:
+        print("💬 Summary only, no inline comments")
+        print("\n".join(summary_only) + "\n")
     if not rows:
         print("No pending drafts.")
     else:
@@ -1202,6 +1266,9 @@ def main():
     s = sub.add_parser("show"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
     s = sub.add_parser("post"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
     s.add_argument("--dry-run", action="store_true"); s.add_argument("--only", choices=["review", "replies"])
+    s.add_argument("--approve", action="store_true", help="submit the review as an approval instead of a comment")
+    s = sub.add_parser("approve"); s.add_argument("repo"); s.add_argument("target", help="PR number or comma list")
+    s.add_argument("--dry-run", action="store_true"); s.set_defaults(only=None, approve=True)
     s = sub.add_parser("stage"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
     s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("report"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
@@ -1219,7 +1286,7 @@ def main():
             a.number = url_pr
     if a.cmd == "path":
         print(f"data:  {home(a.repo)}\ncache: {cache(a.repo)}"); return
-    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report,
+    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "approve": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report,
      "overlaps": cmd_overlaps, "trends": cmd_trends, "config": cmd_config}[a.cmd](a)
 
 

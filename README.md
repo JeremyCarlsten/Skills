@@ -64,6 +64,7 @@ Common commands:
 /review-prs owner/repo show             read the drafts
 /review-prs owner/repo stage 42         put a draft on GitHub as my pending review
 /review-prs owner/repo post 42          post one (or: post all)
+/review-prs owner/repo approve 42       approve it, with the summary as the comment
 /review-prs owner/repo 567              review one PR now (or paste the PR URL)
 /review-prs owner/repo trends           findings that keep repeating, and factory fixes
 /review-prs owner/repo overlaps         open PRs touching the same files
