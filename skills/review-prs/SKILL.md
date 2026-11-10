@@ -1,6 +1,6 @@
 ---
 name: review-prs
-description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Nothing posts until the user approves. Built to run under /loop. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
+description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Drafts wait as the user's private pending review on GitHub; nothing is submitted until they approve. Built to run under /loop. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
 ---
 
 # Review PRs
@@ -11,7 +11,9 @@ Invocation:
 - `/review-prs owner/repo` — one pass.
 - `/review-prs owner/repo --mine` — also review PRs the user opened ("include my PRs" means the same). Pass `--include-own` to `scan`. Under `/loop`, the flag rides along in the loop prompt, so `/loop /review-prs owner/repo --mine` keeps it on.
 - `/loop /review-prs owner/repo` — keep watching (see "Loop mode").
-- `/review-prs owner/repo post 42` · `post 42,57` · `post all` — post approved drafts.
+- `/review-prs owner/repo --local` — keep drafts on this machine only; don't stage them on GitHub.
+- `/review-prs owner/repo stage 42` · `stage all` — put drafts on GitHub as the user's pending review (see "Staging on GitHub").
+- `/review-prs owner/repo post 42` · `post 42,57` · `post all` — post approved drafts, or submit staged ones.
 - `/review-prs owner/repo show` — print pending drafts.
 
 If no repo is given, use the current directory's GitHub remote (`gh repo view --json nameWithOwner -q .nameWithOwner`). If that fails, ask.
@@ -27,14 +29,15 @@ If no repo is given, use the current directory's GitHub remote (`gh repo view --
 | `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. |
 | `show REPO [N]` | Prints pending drafts in readable form. |
 | `digest REPO` | One line per pending draft with door, blast radius and score, riskiest first, then one line per stack. |
-| `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts. Refuses to post a review if the PR moved since it was drafted. |
+| `stage REPO N\|all [--dry-run]` | Creates the review on GitHub as the user's pending (unsubmitted) review, with thread replies attached. Only the user can see it until they submit it. |
+| `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts, or submits a staged review. Refuses to post a review if the PR moved since it was drafted. |
 
 Run `gh auth status` once at the start. If it fails, tell the user to run `gh auth login` and stop.
 
 ## One pass
 
 1. `scan REPO`. Work through PRs that have actions, oldest first. Don't announce skipped PRs one by one; they go in the digest.
-2. Work bottom-up through stacks (see "Stacked PRs"). For each PR: `fetch REPO N`, then do the review (below) and/or the replies, write the draft, then `mark`.
+2. Work bottom-up through stacks (see "Stacked PRs"). For each PR: `fetch REPO N`, then do the review (below) and/or the replies, write the draft, then `mark`, then `stage` it on GitHub unless the user passed `--local`.
 3. End with the digest (below).
 
 Keep each PR self-contained: read what `fetch` wrote, work in that PR's worktree, finish its draft, then move on. If there are more than ~4 PRs to review and you can spawn subagents, hand each PR to its own subagent with this skill's path, the repo, the PR number and the fetch output, and have it write the draft file and return a two-line summary. That keeps one big PR from crowding out the rest.
@@ -105,7 +108,7 @@ What changes when reviewing a layer:
 - **Don't repeat findings across layers.** If the problem lives in a lower layer, comment there, not on every layer that inherits it.
 - **Review bottom-up** within a pass, so findings on lower layers are known when you look at the ones above.
 
-**Restacks.** When a lower layer changes, every layer above gets rebased and gets a new head SHA even though its own changes didn't change. `scan` catches this by comparing the layer's diff fingerprint (`git patch-id`) and marks it `rebased_only` instead of asking for a re-review, so restacks don't trigger a wave of duplicate reviews. If a draft is pending when that happens, `post` moves the review onto the new head automatically, as long as the commented lines are identical; otherwise it asks for a re-review.
+**Restacks.** When a lower layer changes, every layer above gets rebased and gets a new head SHA even though its own changes didn't change. `scan` catches this by comparing the layer's diff fingerprint (`git patch-id`) and marks it `rebased_only` instead of asking for a re-review, so restacks don't trigger a wave of duplicate reviews. If a draft is pending when that happens, `stage` and `post` move the review onto the new head automatically, as long as the commented lines are identical; otherwise it asks for a re-review.
 
 ## Merge Danger
 
@@ -177,7 +180,7 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
 }
 ```
 
-- `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment; `post` refuses one without it.
+- `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment; `stage` and `post` refuse one without it.
 - Inline comment `line` numbers are lines in the PR head version of the file (RIGHT side) and must fall inside a diff hunk, or GitHub rejects the review. Check against `diff.patch`. If a point is about code outside the diff, put it in the review body instead.
 - For `review_comment` replies, `reply_to` is the thread's root comment ID (`reply_to` in `waiting.json`).
 - Reviews post as a plain comment review — never approve or request changes unless the user asks.
@@ -199,19 +202,30 @@ Pending drafts, riskiest first
   #57    Fix login redirect                                        ·  2 replies
 Stack  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
 Skipped: 3 drafts, 1 bot, 4 with nothing new, 2 rebased only
-Next: `show` to read, `post 42` or `post all` to send.
+Next: read the staged ones on GitHub (Files changed tab), `show` for the rest, `post 42` or `post all` to send.
 ```
 
 If nothing needed doing, one line: `review-prs · owner/repo · nothing new.`
 
+## Staging on GitHub
+
+By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the summary, the inline comments and the replies to review threads all show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
+
+Things to know:
+- **Conversation replies can't be staged.** GitHub can only hold inline comments and review-thread replies as pending. Replies to top-level conversation comments stay local; `show` lists them and `post` sends them.
+- **One pending review per person per PR.** If the user already has their own pending review going on a PR, `stage` refuses rather than touching it, and says so. Leave that draft local and mention it in the digest.
+- **Re-staging replaces.** After a re-review, `stage` deletes the earlier pending review it made and creates the new one. It never deletes a pending review it didn't make.
+- **It notices what the user did.** On the next `scan`, a staged review that was submitted is marked posted (leftover conversation replies stay pending), and one the user discarded is marked discarded and not staged again.
+- Skip staging if the user passed `--local` or said they want drafts kept local.
+
 ## Posting
 
-Only when the user asks (`post 42`, `post all`, "send the review on 42"). First run `post ... --dry-run` and check it's what you expect, then run it for real and report what went out. If the user edited a draft, post their edited version exactly. If a review is refused because the PR moved, offer to re-review. Never post during a loop pass on your own.
+Only when the user asks (`post 42`, `post all`, "send the review on 42"). First run `post ... --dry-run` and check it's what you expect, then run it for real and report what went out. For a staged draft, `post` submits the pending review as it now stands on GitHub, including the user's edits there. For a local draft, it posts the draft file as written, including any edits the user made to it. If a review is refused because the PR moved, offer to re-review. Never submit or post during a loop pass on your own; staging is as far as a pass goes.
 
 ## Loop mode
 
 Under `/loop`, each firing is one pass. The state file makes passes cheap: PRs with no new commits and no new comments are skipped without fetching. Each pass:
-- Never posts. It only drafts.
+- Never submits or posts. It drafts, then stages new drafts as pending reviews on GitHub (unless `--local`), which only the user can see.
 - Doesn't re-draft a PR whose pending draft already covers the current head, unless new comments came in.
 - Keeps the digest short, and leaves out anything that was already in the previous digest and hasn't changed.
 

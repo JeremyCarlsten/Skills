@@ -14,7 +14,8 @@ Subcommands
   fetch REPO N                  pull PR details, diff, comments and a worktree
   mark  REPO N --sha S [--comments ID ...]   record what this pass handled
   show  REPO [N]                print pending drafts in readable form
-  post  REPO N|all [--dry-run] [--only review|replies]   post approved drafts
+  stage REPO N|all [--dry-run]  put drafts on GitHub as your pending (unsubmitted) review
+  post  REPO N|all [--dry-run] [--only review|replies]   post approved drafts (submits staged ones)
   digest REPO                  one line per pending draft: door, blast radius, score
   path  REPO                    print the state directory
 
@@ -231,7 +232,10 @@ def cmd_scan(a):
             entry["comments_waiting"] = len(waiting)
 
         d = load_draft(repo, n)
-        if d and d.get("status") == "pending":
+        if d and d.get("status") == "staged":
+            d = reconcile_staged(repo, n, d)
+            entry["staged_on_github"] = d.get("status") == "staged"
+        if d and d.get("status") in ("pending", "staged"):
             entry["pending_draft"] = True
             # A pending draft for this same head and no new comments: nothing to do.
             same = d.get("head_sha") == p["headRefOid"] or entry.get("rebased_only")
@@ -420,7 +424,10 @@ def assessment_problems(d):
 
 def render(d):
     lines = [f"## PR #{d['pr']} — {d.get('title', '')}  [{d.get('status')}]",
-             f"head {d.get('head_sha', '')[:8]}  ·  drafted {d.get('created_at', '')}", ""]
+             f"head {d.get('head_sha', '')[:8]}  ·  drafted {d.get('created_at', '')}"]
+    if d.get("status") == "staged":
+        lines.append(f"On GitHub as your pending review (only you can see it): {d.get('staged_url', '')}")
+    lines.append("")
     r = d.get("review")
     if r:
         lines += ["### Review (posted as a plain comment review)", "", review_body(d), ""]
@@ -444,7 +451,7 @@ def cmd_show(a):
         d = json.loads(f.read_text())
         if a.number and d["pr"] != a.number:
             continue
-        if not a.number and d.get("status") != "pending":
+        if not a.number and d.get("status") not in ("pending", "staged"):
             continue
         print(render(d)); print("\n---\n"); shown += 1
     if not shown:
@@ -486,39 +493,171 @@ def reanchor(repo, n, d, head):
     return None
 
 
+def resolve_commit(repo, n, d, done):
+    """The commit a review should attach to, or None if the PR moved too much."""
+    head = gh_json(["pr", "view", str(n), "-R", repo, "--json", "headRefOid"])["headRefOid"]
+    if head == d["head_sha"]:
+        return head
+    moved = reanchor(repo, n, d, head)
+    if moved:
+        done.append(f"review NOT sent: PR moved from {d['head_sha'][:8]} to {head[:8]} ({moved}); re-run the review")
+        return None
+    done.append(f"PR was rebased to {head[:8]} with the same changes; using the new head")
+    return head
+
+
+def review_payload(d, commit, event):
+    r = d.get("review") or {}
+    payload = {"commit_id": commit, "body": review_body(d),
+               "comments": [{k: v for k, v in c.items() if k in ("path", "line", "start_line", "side", "start_side", "body")}
+                            for c in r.get("comments", [])]}
+    for c in payload["comments"]:
+        c.setdefault("side", "RIGHT")
+    if event:
+        payload["event"] = event
+    return payload
+
+
+def my_pending_review(repo, n, login):
+    for rv in gh_paged(f"repos/{repo}/pulls/{n}/reviews"):
+        if rv.get("state") == "PENDING" and (rv.get("user") or {}).get("login", "").lower() == login.lower():
+            return rv
+    return None
+
+
+def thread_id_for(repo, n, root_comment_id):
+    owner, name = repo.split("/", 1)
+    q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){"
+         "reviewThreads(first:100){nodes{id comments(first:1){nodes{databaseId}}}}}}}")
+    data = gh_json(["api", "graphql", "-f", f"query={q}", "-F", f"o={owner}", "-F", f"r={name}", "-F", f"n={n}"])
+    for t in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+        first = t["comments"]["nodes"]
+        if first and first[0]["databaseId"] == root_comment_id:
+            return t["id"]
+    return None
+
+
+def reconcile_staged(repo, n, d):
+    """A staged draft's review lives on GitHub as PENDING until Jeremy submits or discards it."""
+    rid = d.get("staged_review_id")
+    p = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{n}/reviews/{rid}"], capture_output=True, text=True)
+    if p.returncode != 0:
+        d["status"] = "discarded"
+    else:
+        state = json.loads(p.stdout).get("state")
+        if state != "PENDING":
+            # Submitted on GitHub. Anything that couldn't be staged (conversation replies) still waits.
+            if d.get("review"):
+                d["review"]["posted"] = True
+            for x in d.get("replies", []):
+                if x.get("staged"):
+                    x["posted"] = True
+            left = [x for x in d.get("replies", []) if not x.get("posted")]
+            d["status"] = "pending" if left else "posted"
+            if not left:
+                d["posted_at"] = now()
+    if d["status"] != "staged":
+        draft_file(repo, n).write_text(json.dumps(d, indent=2))
+        st = load_state(repo)
+        st["prs"].get(str(n), {}).pop("staged_review_id", None)
+        save_state(repo, st)
+    return d
+
+
+def stage_one(repo, n, dry):
+    d = load_draft(repo, n)
+    if not d:
+        return f"PR #{n}: no draft"
+    if d.get("status") not in ("pending", "staged"):
+        return f"PR #{n}: draft is {d.get('status')}, nothing to stage"
+    problems = voice_problems(d) + assessment_problems(d)
+    if problems:
+        return f"PR #{n}: NOT staged, fix the draft first: " + "; ".join(problems)
+    thread_replies = [x for x in d.get("replies", []) if x["kind"] == "review_comment" and not x.get("posted")]
+    convo_replies = [x for x in d.get("replies", []) if x["kind"] == "issue_comment" and not x.get("posted")]
+    if not d.get("review") and not thread_replies:
+        return f"PR #{n}: nothing that can wait on GitHub" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
+    done = []
+    commit = resolve_commit(repo, n, d, done)
+    if not commit:
+        return f"PR #{n}: " + "; ".join(done)
+
+    state = load_state(repo)
+    login = me(state)
+    st = state["prs"].setdefault(str(n), {})
+    ours = st.get("staged_review_id")
+    existing = my_pending_review(repo, n, login)
+    if existing and existing["id"] != ours:
+        return (f"PR #{n}: NOT staged, you already have your own pending review on this PR on GitHub. "
+                f"GitHub allows one per person, so submit or discard it first.")
+    if dry:
+        if existing:
+            done.append(f"DRY RUN: delete old staged review {existing['id']}")
+        done.append(f"DRY RUN: create pending review with {len((d.get('review') or {}).get('comments', []))} comments"
+                    + (f" and {len(thread_replies)} thread replies" if thread_replies else ""))
+        return f"PR #{n}: " + "; ".join(done)
+    if existing:
+        run(["gh", "api", "-X", "DELETE", f"repos/{repo}/pulls/{n}/reviews/{existing['id']}"])
+        done.append("replaced the earlier staged review")
+
+    rv = json.loads(run(["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews", "--input", "-"],
+                        input_text=json.dumps(review_payload(d, commit, None))))
+    for rep in thread_replies:
+        tid = thread_id_for(repo, n, rep["reply_to"])
+        if not tid:
+            done.append(f"reply to @{rep.get('to', '?')} kept local (thread not found)")
+            continue
+        m = ("mutation($rv:ID!,$t:ID!,$b:String!){addPullRequestReviewThreadReply("
+             "input:{pullRequestReviewId:$rv,pullRequestReviewThreadId:$t,body:$b}){comment{id}}}")
+        run(["gh", "api", "graphql", "-f", f"query={m}", "-f", f"rv={rv['node_id']}", "-f", f"t={tid}", "-f", f"b={rep['body']}"])
+        rep["staged"] = True
+    d.update(status="staged", staged_review_id=rv["id"], staged_url=rv.get("html_url"), staged_at=now(), staged_commit=commit)
+    st["staged_review_id"] = rv["id"]
+    save_state(repo, state)
+    draft_file(repo, n).write_text(json.dumps(d, indent=2))
+    n_c = len((d.get("review") or {}).get("comments", []))
+    n_r = sum(1 for x in thread_replies if x.get("staged"))
+    done.append(f"waiting on GitHub as your pending review ({n_c} comments, {n_r} thread replies): {rv.get('html_url', '')}")
+    if convo_replies:
+        done.append(f"{len(convo_replies)} conversation replies stay local (GitHub can't hold those as pending); use post")
+    return f"PR #{n}: " + "; ".join(done)
+
+
+def cmd_stage(a):
+    nums = ([json.loads(f.read_text())["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
+             if json.loads(f.read_text()).get("status") == "pending"]
+            if a.target == "all" else [int(x) for x in a.target.split(",")])
+    for n in sorted(nums):
+        print(stage_one(a.repo, n, a.dry_run))
+
+
 def post_one(repo, n, dry, only):
     d = load_draft(repo, n)
     if not d:
         return f"PR #{n}: no draft"
-    if d.get("status") != "pending":
+    if d.get("status") == "staged":
+        d = reconcile_staged(repo, n, d)
+    if d.get("status") not in ("pending", "staged"):
         return f"PR #{n}: draft is {d.get('status')}, nothing to post"
     problems = voice_problems(d) + assessment_problems(d)
-    if problems:
+    if problems and d.get("status") == "pending":
         return f"PR #{n}: NOT posted, fix the draft first: " + "; ".join(problems)
     done = []
     calls = []
     r = d.get("review")
-    if r and only in (None, "review"):
-        head = gh_json(["pr", "view", str(n), "-R", repo, "--json", "headRefOid"])["headRefOid"]
-        commit = d["head_sha"]
-        if head != d["head_sha"]:
-            moved = reanchor(repo, n, d, head)
-            if moved:
-                done.append(f"review NOT posted: PR moved from {d['head_sha'][:8]} to {head[:8]} ({moved}); re-run the review")
-                commit = None
-            else:
-                done.append(f"PR was rebased to {head[:8]} with the same changes; posting against the new head")
-                commit = head
+    if d.get("status") == "staged" and only in (None, "review"):
+        # Submit the pending review exactly as it now stands on GitHub, including any edits made there.
+        calls.append(("staged", ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews/{d['staged_review_id']}/events",
+                                 "--input", "-"], json.dumps({"event": "COMMENT"})))
+        r = None
+    if r and not r.get("posted") and only in (None, "review"):
+        commit = resolve_commit(repo, n, d, done)
         if commit:
-            payload = {"commit_id": commit, "event": "COMMENT", "body": review_body(d),
-                       "comments": [{k: v for k, v in c.items() if k in ("path", "line", "start_line", "side", "start_side", "body")}
-                                    for c in r.get("comments", [])]}
-            for c in payload["comments"]:
-                c.setdefault("side", "RIGHT")
+            payload = review_payload(d, commit, "COMMENT")
             calls.append(("review", ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/reviews", "--input", "-"], json.dumps(payload)))
     if only in (None, "replies"):
         for rep in d.get("replies", []):
-            if rep.get("posted"):
+            if rep.get("posted") or rep.get("staged"):
                 continue
             if rep["kind"] == "review_comment":
                 cmd = ["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{n}/comments/{rep['reply_to']}/replies", "--input", "-"]
@@ -533,14 +672,21 @@ def post_one(repo, n, dry, only):
         if what == "review":
             r["posted"] = True
             done.append("review posted")
+        elif what == "staged":
+            for x in d.get("replies", []):
+                if x.get("staged"):
+                    x["posted"] = True
+            d["review_submitted"] = True
+            done.append("pending review submitted")
         else:
             what["posted"] = True
             done.append(f"reply to @{what.get('to', '?')} posted")
     if not dry:
-        review_ok = not r or r.get("posted")
+        review_ok = (not r or r.get("posted")) if d.get("status") != "staged" else d.get("review_submitted")
         replies_ok = all(x.get("posted") for x in d.get("replies", []))
         if review_ok and replies_ok:
             d["status"] = "posted"
+            load = load_state(repo); load["prs"].get(str(n), {}).pop("staged_review_id", None); save_state(repo, load)
             d["posted_at"] = now()
         draft_file(repo, n).write_text(json.dumps(d, indent=2))
     return f"PR #{n}: " + ("; ".join(done) if done else "nothing to post")
@@ -549,7 +695,7 @@ def post_one(repo, n, dry, only):
 def cmd_post(a):
     if a.target == "all":
         nums = [json.loads(f.read_text())["pr"] for f in (home(a.repo) / "drafts").glob("pr-*.json")
-                if json.loads(f.read_text()).get("status") == "pending"]
+                if json.loads(f.read_text()).get("status") in ("pending", "staged")]
     else:
         nums = [int(x) for x in a.target.split(",")]
     for n in sorted(nums):
@@ -560,7 +706,7 @@ def cmd_digest(a):
     rows = []
     for f in sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:])):
         d = json.loads(f.read_text())
-        if d.get("status") != "pending":
+        if d.get("status") not in ("pending", "staged"):
             continue
         asm = d.get("assessment") or {}
         r = d.get("review") or {}
@@ -573,6 +719,8 @@ def cmd_digest(a):
             parts.append(f"{len(cs) - nits} must-fix, {nits} nits")
         if d.get("replies"):
             parts.append(f"{len(d['replies'])} replies")
+        if d.get("status") == "staged":
+            parts.append("on GitHub, not submitted")
         rows.append((asm.get("rubberstamp", 9), f"  #{d['pr']:<5} {d.get('title', '')[:48]:<48}  " + "  ·  ".join(parts)))
     if not rows:
         print("No pending drafts."); return
@@ -613,12 +761,14 @@ def main():
     s = sub.add_parser("show"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
     s = sub.add_parser("post"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
     s.add_argument("--dry-run", action="store_true"); s.add_argument("--only", choices=["review", "replies"])
+    s = sub.add_parser("stage"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
+    s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("path"); s.add_argument("repo")
     s = sub.add_parser("digest"); s.add_argument("repo")
     a = ap.parse_args()
     if a.cmd == "path":
         print(home(a.repo)); return
-    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest}[a.cmd](a)
+    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage}[a.cmd](a)
 
 
 if __name__ == "__main__":

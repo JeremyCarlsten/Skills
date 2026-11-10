@@ -32,7 +32,7 @@ This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same in
 | Skill | Command | What it does |
 |---|---|---|
 | [review-outstanding](skills/review-outstanding/SKILL.md) | `/review-outstanding` | Reviews your uncommitted and unpushed changes for standards, spec, pattern breaks, refactoring (KISS, SRP), reuse and architecture, then offers to apply fixes. |
-| [review-prs](skills/review-prs/SKILL.md) | `/review-prs owner/repo` | Sweeps a repo's open PRs and drafts big-picture reviews (spec, architecture, security, one-way doors, agent-friendliness, tautological tests, performance) with a Merge Danger call, plus replies to comments in my voice. Nothing posts until I approve. Built for `/loop`, stacked-PR aware. |
+| [review-prs](skills/review-prs/SKILL.md) | `/review-prs owner/repo` | Sweeps a repo's open PRs and drafts big-picture reviews (spec, architecture, security, one-way doors, agent-friendliness, tautological tests, performance) with a Merge Danger call, plus replies to comments in my voice. Drafts land on the PR as my private pending review; nothing is submitted until I approve. Built for `/loop`, stacked-PR aware. |
 
 ### review-prs needs
 
@@ -43,10 +43,12 @@ This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same in
 Common commands:
 
 ```text
-/loop /review-prs owner/repo            keep watching, draft only
+/loop /review-prs owner/repo            keep watching, stage drafts as pending reviews
+/loop /review-prs owner/repo --local    keep drafts on this machine only
 /loop /review-prs owner/repo --mine     also review my own PRs
 /review-prs owner/repo digest           pending drafts, riskiest first
 /review-prs owner/repo show             read the drafts
+/review-prs owner/repo stage 42         put a draft on GitHub as my pending review
 /review-prs owner/repo post 42          post one (or: post all)
 ```
 
