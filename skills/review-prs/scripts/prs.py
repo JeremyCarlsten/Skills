@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Helper for the review-prs skill. Wraps the `gh` CLI so every pass is consistent.
 
-All state lives under ~/.review-prs/<owner>__<repo>/ (override with REVIEW_PRS_HOME),
-so the skill works the same from any directory and never touches your working tree.
+Data (JSON) lives in a .jeremy folder, which is git-ignored globally:
+  - run from inside a clone of the repo: <repo root>/.jeremy/review-prs/
+  - anywhere else:                       ~/.jeremy/review-prs/<owner>__<repo>/
+  (override with REVIEW_PRS_HOME)
 
   state.json        what has been reviewed (head SHA) and which comments were handled
   drafts/pr-N.json  reviews and replies waiting for your OK
+  findings.jsonl    every labelled comment, for trends
+  work/pr-N/        what fetch pulled for each PR
+
+Code checkouts live outside any repo, in ~/.jeremy/cache/<owner>__<repo>/ (override
+with REVIEW_PRS_CACHE), so test runners and linters in your project never see them:
   clone/            a partial clone used to read code at the PR's commit
   wt/pr-N/          a worktree checked out at the PR head
 
@@ -70,11 +77,81 @@ def is_bot(user):
     return bool(BOT_RE.search(user.get("login", "")))
 
 
+_HOMES = {}
+
+
+def ensure_global_ignore():
+    """Make sure `.jeremy/` is in the user's global gitignore. Idempotent."""
+    path = run(["git", "config", "--global", "--get", "core.excludesFile"], check=False).strip()
+    if path:
+        f = Path(os.path.expanduser(path))
+    else:
+        # git reads this file by default when core.excludesFile isn't set
+        xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        f = Path(xdg) / "git" / "ignore"
+    text = f.read_text(encoding="utf-8") if f.exists() else ""
+    if not re.search(r"^/?\.jeremy/?\s*$", text, re.M):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text + ("" if text.endswith("\n") or not text else "\n") + ".jeremy/\n", encoding="utf-8")
+        print(f"review-prs: added .jeremy/ to your global gitignore ({f})", file=sys.stderr)
+    return f
+
+
+def repo_root_for(repo):
+    """The current directory's git root, if it's a clone of `repo`."""
+    root = run(["git", "rev-parse", "--show-toplevel"], check=False).strip()
+    if not root:
+        return None
+    remotes = run(["git", "-C", root, "remote", "-v"], check=False).lower()
+    return Path(root) if re.search(rf"[/:]{re.escape(repo.lower())}(\.git)?\s", remotes) else None
+
+
 def home(repo):
-    base = Path(os.environ.get("REVIEW_PRS_HOME", Path.home() / ".review-prs"))
-    d = base / repo.replace("/", "__")
+    """Where this repo's JSON lives. Inside the repo's own .jeremy folder when run from a clone."""
+    if repo in _HOMES:
+        return _HOMES[repo]
+    if os.environ.get("REVIEW_PRS_HOME"):
+        d = Path(os.environ["REVIEW_PRS_HOME"]) / repo.replace("/", "__")
+    else:
+        root = repo_root_for(repo)
+        if root:
+            ensure_global_ignore()
+            # belt and braces: also ignore it in this clone, in case a repo rule un-ignores it
+            if subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".jeremy/x"]).returncode != 0:
+                excl = root / ".git" / "info" / "exclude"
+                if excl.parent.exists():
+                    excl.write_text((excl.read_text(encoding="utf-8") if excl.exists() else "") + "\n.jeremy/\n", encoding="utf-8")
+            d = root / ".jeremy" / "review-prs"
+        else:
+            d = Path.home() / ".jeremy" / "review-prs" / repo.replace("/", "__")
     (d / "drafts").mkdir(parents=True, exist_ok=True)
+    migrate_old_state(repo, d)
+    _HOMES[repo] = d
     return d
+
+
+def cache(repo):
+    """Where clones and worktrees live: never inside a project, so tools there don't pick them up."""
+    base = Path(os.environ.get("REVIEW_PRS_CACHE", Path.home() / ".jeremy" / "cache"))
+    d = base / repo.replace("/", "__")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def migrate_old_state(repo, d):
+    """One-time move of JSON from the old ~/.review-prs location."""
+    old = Path.home() / ".review-prs" / repo.replace("/", "__")
+    if not (old / "state.json").exists() or (d / "state.json").exists():
+        return
+    import shutil
+    for name in ("state.json", "findings.jsonl", "factory-notes.md"):
+        if (old / name).exists():
+            shutil.copy2(old / name, d / name)
+    for sub in ("drafts", "work"):
+        if (old / sub).exists():
+            shutil.copytree(old / sub, d / sub, dirs_exist_ok=True)
+    old.rename(old.with_name(old.name + ".migrated"))  # so it's only picked up once
+    print(f"review-prs: moved your drafts and state from {old} to {d}", file=sys.stderr)
 
 
 def load_state(repo):
@@ -335,12 +412,12 @@ def cmd_scan(a):
         result.append(entry)
 
     # tidy up worktrees for PRs that closed
-    wt = home(repo) / "wt"
+    wt = cache(repo) / "wt"
     if wt.exists():
         for d in wt.iterdir():
             num = d.name.replace("pr-", "")
             if num not in open_nums:
-                run(["git", "-C", str(home(repo) / "clone"), "worktree", "remove", "--force", str(d)], check=False)
+                run(["git", "-C", str(cache(repo) / "clone"), "worktree", "remove", "--force", str(d)], check=False)
     print(json.dumps({"repo": repo, "me": login, "scanned_at": now(), "config": cfg, "prs": result}, indent=2))
     save_state(repo, state)
 
@@ -390,7 +467,7 @@ def cmd_overlaps(a):
 
 # ---------------------------------------------------------------- fetch
 def ensure_clone(repo):
-    clone = home(repo) / "clone"
+    clone = cache(repo) / "clone"
     if not (clone / ".git").exists() and not (clone / "HEAD").exists():
         run(["gh", "repo", "clone", repo, str(clone), "--", "--filter=blob:none", "--no-checkout", "-q"])
     return clone
@@ -479,7 +556,7 @@ def cmd_fetch(a):
         clone = ensure_clone(repo)
         run(["git", "-C", str(clone), "fetch", "-q", "origin",
              f"+refs/pull/{n}/head:refs/remotes/pr/{n}", pr["baseRefName"]])
-        wt = home(repo) / "wt" / f"pr-{n}"
+        wt = cache(repo) / "wt" / f"pr-{n}"
         if wt.exists():
             run(["git", "-C", str(wt), "checkout", "-q", "--detach", pr["headRefOid"]])
         else:
@@ -735,7 +812,7 @@ def reanchor(repo, n, d, head):
     st = load_state(repo)["prs"].get(str(n), {})
     if not st.get("patch_id") or patch_id(run(["gh", "pr", "diff", str(n), "-R", repo])) != st["patch_id"]:
         return "the PR's changes are different"
-    clone = home(repo) / "clone"
+    clone = cache(repo) / "clone"
     if not clone.exists():
         return "no local clone to compare lines"
     run(["git", "-C", str(clone), "fetch", "-q", "origin", f"+refs/pull/{n}/head:refs/remotes/pr/{n}"], check=False)
@@ -1137,7 +1214,7 @@ def main():
         elif hasattr(a, "number") and a.number is None:
             a.number = url_pr
     if a.cmd == "path":
-        print(home(a.repo)); return
+        print(f"data:  {home(a.repo)}\ncache: {cache(a.repo)}"); return
     {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report,
      "overlaps": cmd_overlaps, "trends": cmd_trends, "config": cmd_config}[a.cmd](a)
 

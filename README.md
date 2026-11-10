@@ -25,6 +25,20 @@ npx skills@latest check
 npx skills@latest update
 ```
 
+The `skills` installer only copies files, so it can't change your git config. `review-prs` adds `.jeremy/` to your global gitignore itself the first time it runs. To do it up front instead:
+
+```bash
+# macOS / Linux / Git Bash
+f=$(git config --global core.excludesFile || echo ~/.config/git/ignore); f="${f/#\~/$HOME}"; mkdir -p "$(dirname "$f")"; grep -qx '.jeremy/' "$f" 2>/dev/null || echo '.jeremy/' >> "$f"
+```
+
+```powershell
+# Windows PowerShell
+$f = git config --global core.excludesFile; if (-not $f) { $f = "$HOME\.config\git\ignore" }; $f = $f -replace '^~', $HOME
+New-Item -ItemType Directory -Force (Split-Path $f) | Out-Null
+if (-not (Test-Path $f) -or -not (Select-String -Path $f -Pattern '^\.jeremy/$' -Quiet)) { Add-Content $f '.jeremy/' }
+```
+
 This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same installer Matt Pocock's skills library uses.
 
 ## Skills
@@ -38,7 +52,7 @@ This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same in
 
 - [GitHub CLI](https://cli.github.com/) installed and logged in (`gh auth login`)
 - Python 3 and git
-- State and drafts are kept in `~/.review-prs/`, outside your repos.
+- Drafts, state and other JSON go in a `.jeremy/` folder (in the repo when you run it from a clone, otherwise `~/.jeremy/`). The first run adds `.jeremy/` to your global gitignore, so it never gets committed. Code checkouts go in `~/.jeremy/cache/`.
 
 Common commands:
 

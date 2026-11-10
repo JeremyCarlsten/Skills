@@ -24,7 +24,11 @@ If no repo is given, use the current directory's GitHub remote (`gh repo view --
 
 ## The helper script
 
-`scripts/prs.py` (in this skill's folder) does the GitHub and git plumbing so every pass behaves the same. Call it with the absolute path to this skill's directory: `python3 <skill-dir>/scripts/prs.py ...` (`python` or `py` on Windows if `python3` isn't found). It keeps all state in `~/.review-prs/<owner>__<repo>/` — its own partial clone and worktrees — so it never touches the user's checkout and works from any terminal.
+`scripts/prs.py` (in this skill's folder) does the GitHub and git plumbing so every pass behaves the same. Call it with the absolute path to this skill's directory: `python3 <skill-dir>/scripts/prs.py ...` (`python` or `py` on Windows if `python3` isn't found).
+
+Where things live (`prs.py path REPO` prints both):
+- **Data** (state, drafts, findings, fetched PR files, factory notes) goes in a `.jeremy` folder. Run from inside a clone of the repo, that's `<repo root>/.jeremy/review-prs/`; from anywhere else, `~/.jeremy/review-prs/<owner>__<repo>/`. Run passes from the same place each time (ideally inside the clone) so they share state. The first run adds `.jeremy/` to the user's global gitignore (the file `core.excludesFile` points to, or git's default `~/.config/git/ignore`) and says so; nothing in `.jeremy` is ever committed. Data from the old `~/.review-prs/` location is moved over once, automatically.
+- **Code checkouts** (a partial clone and per-PR worktrees) go in `~/.jeremy/cache/<owner>__<repo>/`, outside every project, so test runners and linters in the user's repo never pick them up. It never touches the user's own checkout.
 
 | Command | What it does |
 |---|---|
@@ -258,9 +262,9 @@ When a pass drafts a review scoring 1 or 2, the user should hear about it withou
 
 ## Trends
 
-Every reviewed comment is logged (`~/.review-prs/<repo>/findings.jsonl`). `trends` groups ❌ and 💡 findings by category and shows the ones that keep coming back across PRs. When the same problem shows up in three or more PRs, the fix belongs in the factory: a rule in `CLAUDE.md`, a line in the relevant skill (`/implement`, `/to-tickets`), a lint rule or a test helper.
+Every reviewed comment is logged (`findings.jsonl` in the data folder). `trends` groups ❌ and 💡 findings by category and shows the ones that keep coming back across PRs. When the same problem shows up in three or more PRs, the fix belongs in the factory: a rule in `CLAUDE.md`, a line in the relevant skill (`/implement`, `/to-tickets`), a lint rule or a test helper.
 
-When the user asks for trends (or a "factory report"), run `trends REPO`, read the examples, look at the repo's current `CLAUDE.md` and agent docs, and write a short report to `~/.review-prs/<owner>__<repo>/factory-notes.md`: for each repeating category, what keeps going wrong (with PR links), and the exact text of the rule or change you'd add and where. Show it to the user. Don't edit the repo's docs or skills yourself; that's the user's call.
+When the user asks for trends (or a "factory report"), run `trends REPO`, read the examples, look at the repo's current `CLAUDE.md` and agent docs, and write a short report to `factory-notes.md` in the data folder: for each repeating category, what keeps going wrong (with PR links), and the exact text of the rule or change you'd add and where. Show it to the user. Don't edit the repo's docs or skills yourself; that's the user's call.
 
 ## Staging on GitHub
 
