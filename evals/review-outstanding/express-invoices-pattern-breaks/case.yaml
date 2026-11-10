@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: express-invoices-pattern-breaks
+expected_outcome: |
+  Report flags routes importing db/repositories directly (architecture), .then chains / missing asyncHandler / hand-built error JSON (standards), reinvented isEmail and formatCurrency (reuse), missing pagination/sorting and positive-int validation (spec), and the multi-job POST handler (SRP); then offers fixes without modifying code.
+context:
+  scaffold_script: place-files.sh

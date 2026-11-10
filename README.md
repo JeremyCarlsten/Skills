@@ -1,0 +1,63 @@
+# Skills
+
+Claude Code skills I use for code review in an agent-driven workflow.
+
+## Install
+
+Install everything, globally, for Claude Code:
+
+```bash
+npx skills@latest add JeremyCarlsten/Skills -g -a claude-code -s '*' -y
+```
+
+Or pick one:
+
+```bash
+npx skills@latest add JeremyCarlsten/Skills -g -a claude-code -s review-prs -y
+```
+
+`-g` installs to your user skills folder (`~/.claude/skills/`), so the skills work in every project. Leave it off to install into the current project only.
+
+Update later with:
+
+```bash
+npx skills@latest check
+npx skills@latest update
+```
+
+This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same installer Matt Pocock's skills library uses.
+
+## Skills
+
+| Skill | Command | What it does |
+|---|---|---|
+| [review-outstanding](skills/review-outstanding/SKILL.md) | `/review-outstanding` | Reviews your uncommitted and unpushed changes for standards, spec, pattern breaks, refactoring (KISS, SRP), reuse and architecture, then offers to apply fixes. |
+| [review-prs](skills/review-prs/SKILL.md) | `/review-prs owner/repo` | Sweeps a repo's open PRs and drafts big-picture reviews (spec, architecture, security, one-way doors, agent-friendliness, tautological tests, performance) with a Merge Danger call, plus replies to comments in my voice. Nothing posts until I approve. Built for `/loop`, stacked-PR aware. |
+
+### review-prs needs
+
+- [GitHub CLI](https://cli.github.com/) installed and logged in (`gh auth login`)
+- Python 3 and git
+- State and drafts are kept in `~/.review-prs/`, outside your repos.
+
+Common commands:
+
+```text
+/loop /review-prs owner/repo            keep watching, draft only
+/loop /review-prs owner/repo --mine     also review my own PRs
+/review-prs owner/repo digest           pending drafts, riskiest first
+/review-prs owner/repo show             read the drafts
+/review-prs owner/repo post 42          post one (or: post all)
+```
+
+## Repo layout
+
+```text
+skills/<name>/SKILL.md     what gets installed (plus any scripts/ and references/)
+evals/<name>/              test cases for the skill, not installed
+```
+
+## Credits
+
+- `review-outstanding` and `review-prs` build on Matt Pocock's [code-review](https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review) skill (Standards + Spec axes, Fowler smell baseline).
+- The Merge Danger section (door, blast radius) follows the [pr](https://github.com/mattpocock/skills/tree/main/skills/engineering/pr) skill, which credits Dex Horthy's [show-me](https://github.com/humanlayer/skills/blob/main/plugins/show-me/skills/show-me/SKILL.md) skill at HumanLayer.

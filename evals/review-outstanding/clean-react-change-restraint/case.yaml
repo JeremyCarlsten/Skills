@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: clean-react-change-restraint
+expected_outcome: |
+  Report recognizes the change follows existing patterns, reports no blockers, does not invent problems, skips/mentions the lockfile noise, and covers the unpushed commit as well as the uncommitted test.
+context:
+  scaffold_script: place-files.sh

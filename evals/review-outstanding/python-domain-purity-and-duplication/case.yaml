@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: python-domain-purity-and-duplication
+expected_outcome: |
+  Report flags requests imported into the pure domain layer, duplicated date parsing that reinvents app/utils/dates.parse_iso_date, the boolean flag param + nesting, and the unittest-style test that breaks the pytest pattern; notes no spec found; offers fixes.
+context:
+  scaffold_script: place-files.sh
