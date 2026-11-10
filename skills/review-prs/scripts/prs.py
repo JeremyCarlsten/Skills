@@ -399,6 +399,17 @@ def cmd_scan(a):
             entry["actions"].append("reply")
             entry["comments_waiting"] = len(waiting)
 
+        # other reviewers' comments not judged yet (fetch narrows this to unresolved threads)
+        judged = set(st.get("judged_ids", []))
+        is_me = lambda u: (u or {}).get("login", "").lower() == login.lower()
+        fresh = [c["id"] for c in rc if not c.get("in_reply_to_id") and not is_me(c.get("user")) and c["id"] not in judged]
+        fresh += [c["id"] for c in ic if is_bot(c.get("user")) and not is_me(c.get("user")) and c["id"] not in judged]
+        fresh += [v["id"] for v in gh_paged(f"repos/{repo}/pulls/{n}/reviews")
+                  if (v.get("body") or "").strip() and not is_me(v.get("user")) and v.get("state") != "PENDING" and v["id"] not in judged]
+        if fresh:
+            entry["actions"].append("validate")
+            entry["comments_to_validate"] = len(fresh)
+
         d = load_draft(repo, n)
         if d and d.get("status") == "staged":
             d = reconcile_staged(repo, n, d)
@@ -407,7 +418,7 @@ def cmd_scan(a):
             entry["pending_draft"] = True
             # A pending draft for this same head and no new comments: nothing to do.
             same = d.get("head_sha") == p["headRefOid"] or entry.get("rebased_only")
-            if same and "reply" not in entry["actions"] and "re-review" not in entry["actions"] and not entry.get("forced"):
+            if same and not {"reply", "re-review", "validate"} & set(entry["actions"]) and not entry.get("forced"):
                 entry["actions"] = []
                 entry["skip_reason"] = "draft already waiting for you"
         if not entry["actions"] and not entry["skip_reason"]:
@@ -540,15 +551,44 @@ def cmd_fetch(a):
          "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
          "comments(first:50){nodes{databaseId body createdAt author{login}}}}}}}}")
     data = gh_json(["api", "graphql", "-f", f"query={q}", "-F", f"o={owner}", "-F", f"r={name}", "-F", f"n={n}"])
-    open_threads = []
+    open_threads, unresolved_roots = [], set()
     for t in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
         cs = t["comments"]["nodes"]
+        if not t["isResolved"] and cs:
+            unresolved_roots.add(cs[0]["databaseId"])
         if t["isResolved"] or not cs or (cs[0].get("author") or {}).get("login", "").lower() != login.lower():
             continue
         open_threads.append({"thread_id": t["id"], "reply_to": cs[0]["databaseId"], "path": t["path"], "line": t["line"],
                              "outdated": t["isOutdated"], "label": label_of(cs[0]["body"]), "body": cs[0]["body"],
                              "replies": [{"author": (c.get("author") or {}).get("login"), "body": c["body"]} for c in cs[1:]]})
     (work / "my_open_threads.json").write_text(json.dumps(open_threads, indent=2), encoding="utf-8")
+
+    # other reviewers' comments to validate: unresolved inline threads (root comment), non-empty
+    # review summaries, and conversation comments from review bots. Skips anything already judged.
+    judged = set(st.get("judged_ids", []))
+    def mine(u):
+        return (u or {}).get("login", "").lower() == login.lower()
+    to_validate = []
+    for c in rc:
+        if c.get("in_reply_to_id") or mine(c.get("user")) or c["id"] in judged or c["id"] not in unresolved_roots:
+            continue
+        to_validate.append({"kind": "review_comment", "id": c["id"], "author": c["user"]["login"], "path": c.get("path"),
+                            "line": c.get("line") or c.get("original_line"), "body": c.get("body"), "diff_hunk": c.get("diff_hunk")})
+    for v in rv:
+        if mine(v.get("user")) or not (v.get("body") or "").strip() or v["id"] in judged or v.get("state") == "PENDING":
+            continue
+        to_validate.append({"kind": "review", "id": v["id"], "node_id": v.get("node_id"), "author": v["user"]["login"],
+                            "state": v.get("state"), "body": v.get("body")})
+    for c in ic:
+        if mine(c.get("user")) or not is_bot(c.get("user")) or c["id"] in judged:
+            continue
+        to_validate.append({"kind": "issue_comment", "id": c["id"], "author": c["user"]["login"], "body": c.get("body")})
+    (work / "to_validate.json").write_text(json.dumps(to_validate, indent=2), encoding="utf-8")
+    # comments in resolved threads don't need a verdict; remember them so scan stops flagging them
+    resolved = {c["id"] for c in rc if not c.get("in_reply_to_id") and c["id"] not in unresolved_roots and not mine(c.get("user"))}
+    if resolved:
+        st["judged_ids"] = sorted(judged | resolved)
+        state["prs"][str(n)] = st
 
     # other open PRs touching the same files (outside this PR's stack)
     overlaps = [p for p in overlap_pairs(open_prs_with_files(repo)) if n in (p["a"], p["b"])]
@@ -582,7 +622,8 @@ def cmd_fetch(a):
         "own_pr": pr["author"]["login"].lower() == login.lower(),
         "work_dir": str(work), "worktree": worktree,
         "files": {k: str(work / k) for k in ["pr.json", "diff.patch", "comments.json", "waiting.json", "issues.json",
-                                              "my_open_threads.json", "overlaps.json"]},
+                                              "my_open_threads.json", "overlaps.json", "to_validate.json"]},
+        "to_validate": len(to_validate),
         "my_open_threads": len(open_threads),
         "overlapping_prs": [p["b"] if p["a"] == n else p["a"] for p in overlaps],
         "incremental_patch": incremental,
@@ -618,13 +659,29 @@ def log_findings(repo, n, sha):
             out.write(json.dumps({"date": now(), "pr": n, "sha": sha, "path": c.get("path"), "line": c.get("line"),
                                   "label": label_of(c.get("body")), "category": c.get("category", "other"),
                                   "text": first[:200]}, ensure_ascii=False) + "\n")
-        for x in d.get("agree", []):
+        for x in verdicts(d):
+            if x.get("verdict") != "valid":
+                continue
             key = (n, sha, x.get("path"), f"agree-{x.get('id')}")
             if key in seen:
                 continue
             out.write(json.dumps({"date": now(), "pr": n, "sha": sha, "path": x.get("path"), "line": f"agree-{x.get('id')}",
                                   "label": x.get("severity", "💡"), "category": x.get("category", "other"),
                                   "text": f"(agreed with @{x.get('author', '?')}) {x.get('why', '')[:180]}"}, ensure_ascii=False) + "\n")
+    vf = home(repo) / "verdicts.jsonl"
+    known = set()
+    if vf.exists():
+        for line in vf.read_text(encoding="utf-8").splitlines():
+            try:
+                known.add(json.loads(line)["id"])
+            except (ValueError, KeyError):
+                pass
+    with vf.open("a", encoding="utf-8") as out:
+        for x in verdicts(d):
+            if x.get("id") in known:
+                continue
+            out.write(json.dumps({"date": now(), "pr": n, "id": x.get("id"), "author": x.get("author"),
+                                  "verdict": x.get("verdict"), "category": x.get("category", "other")}, ensure_ascii=False) + "\n")
 
 
 def cmd_trends(a):
@@ -646,6 +703,24 @@ def cmd_trends(a):
         prs = sorted({x["pr"] for x in xs})
         if len(prs) >= a.min_prs:
             rows.append((len(prs), cat, xs, prs))
+    accuracy = {}
+    vf = home(a.repo) / "verdicts.jsonl"
+    if vf.exists():
+        for line in vf.read_text(encoding="utf-8").splitlines():
+            try:
+                x = json.loads(line)
+            except ValueError:
+                continue
+            if datetime.fromisoformat(x["date"]).timestamp() >= cutoff:
+                if x.get("verdict") in ("valid", "invalid", "unsure"):
+                    accuracy.setdefault(x.get("author", "?"), {"valid": 0, "invalid": 0, "unsure": 0})[x["verdict"]] += 1
+    if accuracy:
+        print(f"Other reviewers, last {a.days} days (how their comments held up)")
+        for who, c in sorted(accuracy.items(), key=lambda kv: -sum(kv[1].values())):
+            total = c["valid"] + c["invalid"]
+            pct = f"{round(100 * c['valid'] / total)}% valid" if total else "no verdicts"
+            print(f"  @{who}: 👍{c['valid']} 👎{c['invalid']} unsure {c['unsure']}  ({pct})")
+        print()
     if not rows:
         print(f"Nothing has repeated across {a.min_prs}+ PRs in the last {a.days} days."); return
     print(f"Repeating findings, last {a.days} days (❌ and 💡 only)\n")
@@ -667,6 +742,9 @@ def cmd_mark(a):
         if diff.exists():
             st["patch_id"] = patch_id(diff.read_text(encoding="utf-8"))
         log_findings(a.repo, a.number, a.sha)
+        d = load_draft(a.repo, a.number)
+        if d:
+            st["judged_ids"] = sorted(set(st.get("judged_ids", [])) | {x["id"] for x in verdicts(d) if isinstance(x.get("id"), int)})
     seen = set(st.get("seen_comment_ids", []))
     seen.update(int(c) for c in a.comments or [])
     st["seen_comment_ids"] = sorted(seen)
@@ -688,6 +766,18 @@ def label_of(body):
     return None
 
 
+REACTION = {"valid": ("+1", "THUMBS_UP", "👍"), "invalid": ("-1", "THUMBS_DOWN", "👎")}
+
+
+def verdicts(d):
+    """Judgements on other reviewers' comments. Older `agree` entries count as valid."""
+    out = list(d.get("verdicts", []))
+    for x in d.get("agree", []):
+        x.setdefault("verdict", "valid")
+        out.append(x)
+    return out
+
+
 def label_counts(d):
     cs = (d.get("review") or {}).get("comments", [])
     counts = {e: 0 for e in LABELS}
@@ -696,8 +786,11 @@ def label_counts(d):
         if e:
             counts[e] += 1
     shown = " ".join(f"{'⛏️' if e == '⛏' else e}{n}" for e, n in counts.items() if n)
-    if d.get("agree"):
-        shown = (shown + " " if shown else "") + f"👍{len(d['agree'])}"
+    vs = verdicts(d)
+    for v, emoji in (("valid", "👍"), ("invalid", "👎")):
+        k = sum(1 for x in vs if x.get("verdict") == v)
+        if k:
+            shown = (shown + " " if shown else "") + f"{emoji}{k}"
     return shown or "no comments"
 
 
@@ -722,6 +815,8 @@ def local_report(d):
     parts = []
     if (r.get("body") or "").strip():
         parts.append("Summary (posted): " + r["body"].strip())
+        if (r.get("summary_reason") or "").strip():
+            parts.append("Why this summary (local, so you can back it up): " + r["summary_reason"].strip())
     if (r.get("private_take") or "").strip():
         parts.append("Private take: " + r["private_take"].strip())
     block = merge_danger_block(d.get("assessment"))
@@ -756,6 +851,12 @@ def assessment_problems(d):
         out.append("assessment.rubberstamp must be an integer 1-5")
     elif a.get("door") == "one-way" and rs > 3:
         out.append("a one-way door caps rubberstampability at 3")
+    if not (d.get("change_summary") or "").strip():
+        out.append("draft needs a change_summary (one or two sentences on what the PR does)")
+    elif len(d["change_summary"]) > 300:
+        out.append("change_summary should be short (under 300 characters)")
+    if rs == 3 and not blocking_count(d) and not a.get("look_at"):
+        out.append("a 3/5 with no ❌ needs assessment.look_at: the one to three things you should check yourself")
     return out
 
 
@@ -765,9 +866,17 @@ def render(d):
     if d.get("status") == "staged":
         lines.append(f"On GitHub as your pending review (only you can see it): {d.get('staged_url', '')}")
     lines.append("")
+    if d.get("change_summary"):
+        lines += [f"What it does: {d['change_summary'].strip()}", ""]
+    if d.get("stack_summary"):
+        lines += [f"The whole stack: {d['stack_summary'].strip()}", ""]
     r = d.get("review")
     if r:
         lines += ["### Your read on this PR (local only, not posted)", "", local_report(d), ""]
+        for item in (d.get("assessment") or {}).get("look_at", []):
+            lines.append(f"Look at: {item}")
+        if (d.get("assessment") or {}).get("look_at"):
+            lines.append("")
         lines += ["### Inline comments (these go on the PR)" if r.get("comments") else "### No inline comments", ""]
         for c in r.get("comments", []):
             rng = f"{c['start_line']}-{c['line']}" if c.get("start_line") else str(c["line"])
@@ -777,11 +886,14 @@ def render(d):
                   f"> {(rep.get('context') or '').strip()[:300]}", "", rep["body"].strip(), ""]
     if d.get("notes_for_me"):
         lines += ["### Notes for you (not posted)", "", d["notes_for_me"].strip(), ""]
-    if d.get("agree"):
-        lines += ["### 👍 Agreeing with existing comments (reaction added when you post or submit)", ""]
-        for x in d["agree"]:
+    vs = verdicts(d)
+    if vs:
+        lines += ["### Other reviewers' comments (👍/👎 added when you post or submit)", ""]
+        for x in vs:
+            mark = {"valid": "👍", "invalid": "👎", "skip": "·"}.get(x.get("verdict"), "🤷")
+            where = f"{x.get('path')}:{x.get('line')}" if x.get("path") else x.get("kind", "comment")
             done = " (done)" if x.get("reacted") else ""
-            lines += [f"- @{x.get('author', '?')} on {x.get('path') or 'the PR'}{':' + str(x['line']) if x.get('line') else ''}: {x.get('why', '').strip()}{done}"]
+            lines += [f"- {mark} @{x.get('author', '?')} on {where}: {x.get('why', '').strip()}{done}"]
         lines.append("")
     for p in voice_problems(d) + assessment_problems(d):
         lines.append(f"WARNING: {p} (post will refuse this draft)")
@@ -817,9 +929,22 @@ def voice_problems(d):
     out = [f"{where} has an em dash" for where, t in texts if DASH_RE.search(t or "")]
     out += [f"{where} mentions the Merge Danger call (door, blast radius or rubberstampability stay local)"
             for where, t in texts if LEAK_RE.search(t or "")]
-    for x in d.get("agree", []):
-        if x.get("kind") not in ("review_comment", "issue_comment") or not isinstance(x.get("id"), int):
-            out.append(f"agree entry for @{x.get('author', '?')} needs kind review_comment|issue_comment and a numeric id")
+    body = ((r or {}).get("body") or "").strip()
+    if body:
+        if label_of(body) != "❌":
+            out.append("review summary is only for blocking issues: start it with ❌, or leave it empty")
+        if not ((r or {}).get("summary_reason") or "").strip():
+            out.append("review summary needs a summary_reason (local only) explaining the evidence")
+    for x in verdicts(d):
+        who = f"@{x.get('author', '?')}"
+        if x.get("kind") not in ("review_comment", "issue_comment", "review") or not isinstance(x.get("id"), int):
+            out.append(f"verdict on {who} needs kind review_comment|issue_comment|review and a numeric id")
+        if x.get("verdict") not in ("valid", "invalid", "unsure", "skip"):
+            out.append(f"verdict on {who} must be valid, invalid, unsure or skip")
+        if x.get("kind") == "review" and not x.get("node_id"):
+            out.append(f"verdict on {who}'s review needs its node_id")
+        if not (x.get("why") or "").strip():
+            out.append(f"verdict on {who} needs a why")
     for c in (r or {}).get("comments", []):
         lab = label_of(c.get("body"))
         if not lab:
@@ -894,18 +1019,23 @@ def thread_id_for(repo, n, root_comment_id):
 
 
 def add_agree_reactions(repo, d, done):
-    """👍 the other reviewers' comments that already raise one of our findings."""
-    for x in d.get("agree", []):
-        if x.get("reacted"):
+    """👍 the other reviewers' comments judged valid, 👎 the ones judged invalid. Unsure gets nothing."""
+    for x in verdicts(d):
+        if x.get("reacted") or x.get("verdict") not in REACTION:
             continue
-        kind = "pulls" if x.get("kind") == "review_comment" else "issues"
-        res = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/{kind}/comments/{x['id']}/reactions",
-                              "-f", "content=+1"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        rest, gql, emoji = REACTION[x["verdict"]]
+        if x.get("kind") == "review":
+            m = "mutation($s:ID!,$c:ReactionContent!){addReaction(input:{subjectId:$s,content:$c}){reaction{content}}}"
+            cmd = ["gh", "api", "graphql", "-f", f"query={m}", "-f", f"s={x['node_id']}", "-f", f"c={gql}"]
+        else:
+            kind = "pulls" if x.get("kind") == "review_comment" else "issues"
+            cmd = ["gh", "api", "-X", "POST", f"repos/{repo}/{kind}/comments/{x['id']}/reactions", "-f", f"content={rest}"]
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if res.returncode == 0:
             x["reacted"] = True
-            done.append(f"👍 on @{x.get('author', '?')}'s comment")
+            done.append(f"{emoji} on @{x.get('author', '?')}'s comment")
         else:
-            done.append(f"couldn't 👍 @{x.get('author', '?')}'s comment ({res.stderr.strip()[:80]})")
+            done.append(f"couldn't {emoji} @{x.get('author', '?')}'s comment ({res.stderr.strip()[:80]})")
 
 
 def resolve_threads(repo, d, done):
@@ -965,7 +1095,8 @@ def stage_one(repo, n, dry):
     convo_replies = [x for x in d.get("replies", []) if x["kind"] == "issue_comment" and not x.get("posted")]
     if not (d.get("review") or {}).get("comments") and not thread_replies:
         # A summary on its own reads better as a one-step approve or comment than as a pending review.
-        kind = "summary only, kept local for `approve` or `post`" if has_inline(d) else "nothing to put on GitHub (your read stays local, see report)"
+        kind = (f"blocking summary with no inline comments, kept local: post {n}" if has_inline(d)
+                else f"nothing to put on GitHub (your read stays local, see report; approve {n} if it's good)")
         return f"PR #{n}: {kind}" + (f"; {len(convo_replies)} conversation replies stay local, use post" if convo_replies else "")
     done = []
     commit = resolve_commit(repo, n, d, done)
@@ -1030,6 +1161,11 @@ def post_one(repo, n, dry, only, approve=False):
     if d.get("status") not in ("pending", "staged"):
         return f"PR #{n}: draft is {d.get('status')}, nothing to post"
     event = "APPROVE" if approve else "COMMENT"
+    if approve:
+        r0 = d.get("review") or {}
+        blocking = [c for c in r0.get("comments", []) if label_of(c.get("body")) == "❌"] + ([1] if label_of(r0.get("body")) == "❌" else [])
+        if blocking:
+            return f"PR #{n}: NOT approved, the review has {len(blocking)} blocking finding(s). Use post, or drop the ❌ items first."
     problems = voice_problems(d) + assessment_problems(d)
     if problems and d.get("status") == "pending":
         return f"PR #{n}: NOT posted, fix the draft first: " + "; ".join(problems)
@@ -1058,9 +1194,9 @@ def post_one(repo, n, dry, only, approve=False):
                 cmd = ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{n}/comments", "--input", "-"]
             calls.append((rep, cmd, json.dumps({"body": rep["body"]})))
     if dry:
-        for x in d.get("agree", []):
-            if not x.get("reacted"):
-                done.append(f"DRY RUN: 👍 on @{x.get('author', '?')}'s {x.get('kind')} {x.get('id')}")
+        for x in verdicts(d):
+            if not x.get("reacted") and x.get("verdict") in REACTION:
+                done.append(f"DRY RUN: {REACTION[x['verdict']][2]} on @{x.get('author', '?')}'s {x.get('kind')} {x.get('id')}")
     for what, cmd, body in calls:
         if dry:
             done.append(f"DRY RUN: {' '.join(cmd)}  <<< {body[:200]}")
@@ -1101,7 +1237,7 @@ def post_one(repo, n, dry, only, approve=False):
         if only in (None, "review"):
             add_agree_reactions(repo, d, done)
         review_ok = (not r or r.get("posted")) if d.get("status") != "staged" else d.get("review_submitted")
-        replies_ok = all(x.get("posted") for x in d.get("replies", [])) and all(x.get("reacted") for x in d.get("agree", []))
+        replies_ok = all(x.get("posted") for x in d.get("replies", [])) and all(x.get("reacted") for x in verdicts(d) if x.get("verdict") in REACTION)
         if review_ok and replies_ok:
             d["status"] = "posted"
             load = load_state(repo); load["prs"].get(str(n), {}).pop("staged_review_id", None); save_state(repo, load)
@@ -1122,76 +1258,114 @@ def cmd_post(a):
         print(post_one(a.repo, n, a.dry_run, a.only, approve=getattr(a, "approve", False)))
 
 
+def blocking_count(d):
+    r = d.get("review") or {}
+    n = sum(1 for c in r.get("comments", []) if label_of(c.get("body")) == "❌")
+    return n + (1 if label_of(r.get("body")) == "❌" else 0)
+
+
+def tier_of(d, ci):
+    """Where a reviewed PR lands in the digest."""
+    score = (d.get("assessment") or {}).get("rubberstamp")
+    if not isinstance(score, int):
+        return None
+    if score <= 2 or blocking_count(d):
+        return "urgent"
+    if score == 3:
+        return "call"
+    if score == 5 and ci == "passing":
+        return "ready"
+    return "skim"
+
+
+TIERS = [("urgent", "🚨 Needs you (score 1-2, or a ❌ for the author)"),
+         ("call", "👀 Your call (3/5, nothing for the author to fix, but a person should decide)"),
+         ("skim", "👍 Skim and approve (4/5, or 5/5 waiting on CI)"),
+         ("ready", "✅ Merge-ready (5/5, no ❌, CI green)")]
+
+
 def cmd_digest(a):
-    rows = []
-    for f in sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:])):
-        d = json.loads(f.read_text(encoding="utf-8"))
-        if d.get("status") not in ("pending", "staged"):
-            continue
-        asm = d.get("assessment") or {}
-        r = d.get("review") or {}
-        cs = r.get("comments", [])
-        parts = []
-        if asm:
-            parts.append(f"{asm.get('door', '?')} · {asm.get('blast_radius', '?')} · {asm.get('rubberstamp', '?')}/5")
-        if r:
-            parts.append(label_counts(d))
-        if d.get("replies"):
-            parts.append(f"{len(d['replies'])} replies")
-        if d.get("status") == "staged":
-            parts.append("on GitHub, not submitted")
-        rows.append((asm.get("rubberstamp", 9), f"  #{d['pr']:<5} {d.get('title', '')[:48]:<48}  " + "  ·  ".join(parts)))
-    # Needs you now: low scores. Merge-ready: reviewed at the current head, 5/5, no ❌, CI green.
     prs_now = gh_json(["pr", "list", "-R", a.repo, "--state", "open", "--limit", "200", "--json",
                        "number,title,headRefOid,headRefName,baseRefName"]) or []
     heads = {p["number"]: p["headRefOid"] for p in prs_now}
     signals = pr_signals(a.repo)
-    urgent, ready = [], []
+    drafts = {}
     for f in (home(a.repo) / "drafts").glob("pr-*.json"):
         d = json.loads(f.read_text(encoding="utf-8"))
-        n, asm = d["pr"], d.get("assessment") or {}
-        if n not in heads or d.get("status") == "discarded" or not d.get("review"):
-            continue
-        blockers = sum(1 for c in d["review"].get("comments", []) if label_of(c.get("body")) == "❌")
-        current = d.get("head_sha") == heads[n]
-        if d.get("status") in ("pending", "staged") and isinstance(asm.get("rubberstamp"), int) and asm["rubberstamp"] <= 2:
-            urgent.append(f"  #{n:<5} {d.get('title', '')[:48]:<48}  {asm['rubberstamp']}/5  {asm.get('rubberstamp_reason', '')[:70]}")
-        if current and asm.get("rubberstamp") == 5 and not blockers and signals.get(n, {}).get("ci") == "passing":
-            ready.append(f"  #{n:<5} {d.get('title', '')[:48]}")
-    if urgent:
-        print("🚨 Needs you")
-        print("\n".join(sorted(urgent)) + "\n")
-    if ready:
-        print("✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)")
-        print("\n".join(sorted(ready)) + "\n")
-    summary_only = []
-    for f in sorted((home(a.repo) / "drafts").glob("pr-*.json"), key=lambda p: int(p.stem[3:])):
-        d = json.loads(f.read_text(encoding="utf-8"))
-        r = d.get("review") or {}
-        if d.get("status") == "pending" and not r.get("posted") and not r.get("comments") and (r.get("body") or "").strip():
-            score = (d.get("assessment") or {}).get("rubberstamp", "?")
-            summary_only.append(f"  #{d['pr']:<5} {d.get('title', '')[:48]}  ({score}/5)\n         \"{r['body'].strip()}\"\n"
-                                f"         -> approve {d['pr']}  ·  post {d['pr']} (comment only)")
-    if summary_only:
-        print("💬 Summary only, no inline comments")
-        print("\n".join(summary_only) + "\n")
-    if not rows:
-        print("No pending drafts.")
-    else:
-        print("Pending drafts, riskiest first")
-        for _, line in sorted(rows):
-            print(line)
+        if d["pr"] in heads and d.get("status") != "discarded":
+            drafts[d["pr"]] = d
 
-    # stacks: bottom to top, with the stack's worst door and lowest score
+    blocks = {t: [] for t, _ in TIERS}
+    replies_only, moved = [], []
+    for n, d in sorted(drafts.items()):
+        r, asm = d.get("review") or {}, d.get("assessment") or {}
+        ci = signals.get(n, {}).get("ci", "none")
+        if not d.get("review"):
+            left = [x for x in d.get("replies", []) if not x.get("posted")]
+            if left:
+                replies_only.append(f"  #{n:<5} {d.get('title', '')[:48]:<48}  {len(left)} replies  -> show {n} · post {n}")
+            continue
+        if d.get("head_sha") != heads[n]:
+            moved.append(f"#{n}")
+            continue
+        tier = tier_of(d, ci)
+        if not tier:
+            continue
+        status = {"staged": "on GitHub, not submitted", "posted": "posted"}.get(d.get("status"), "local draft")
+        head = (f"  #{n:<5} {d.get('title', '')[:48]}\n         {asm.get('door', '?')} · {asm.get('blast_radius', '?')} · "
+                f"{asm.get('rubberstamp')}/5 · {label_counts(d)} · CI {ci} · {status}")
+        lines = [head]
+        if d.get("change_summary"):
+            lines.append(f"         what: {d['change_summary'].strip()}")
+        if tier == "urgent":
+            lines.append(f"         why: {asm.get('rubberstamp_reason', '').strip()}")
+            if (r.get("body") or "").strip():
+                lines.append(f"         summary: \"{r['body'].strip()}\"")
+                if (r.get("summary_reason") or "").strip():
+                    lines.append(f"         evidence: {r['summary_reason'].strip()}")
+        elif tier == "call":
+            lines.append(f"         why 3/5: {asm.get('rubberstamp_reason', '').strip()}")
+            for item in asm.get("look_at", []):
+                lines.append(f"         look at: {item}")
+        elif tier == "skim":
+            lines.append(f"         why: {asm.get('rubberstamp_reason', '').strip()}")
+        actions = []
+        if d.get("status") == "staged":
+            actions.append(f"read on GitHub ({d.get('staged_url', '')})")
+        elif d.get("status") == "pending" and (r.get("comments") or (r.get("body") or "").strip()) and not r.get("posted"):
+            actions.append(f"post {n}")
+        if tier in ("ready", "skim", "call") and not blocking_count(d):
+            actions.append(f"approve {n}")
+        if actions:
+            lines.append("         -> " + " · ".join(actions))
+        blocks[tier].append("\n".join(lines))
+
+    printed = False
+    for t, title in TIERS:
+        if blocks[t]:
+            print(title)
+            print("\n\n".join(blocks[t]) + "\n")
+            printed = True
+    if replies_only:
+        print("💬 Replies waiting")
+        print("\n".join(replies_only) + "\n")
+        printed = True
+    if moved:
+        print(f"⏳ Changed since review (next pass picks them up): {', '.join(moved)}\n")
+    if not printed:
+        print("No reviewed PRs waiting on you.\n")
+
+    # stacks: the whole picture, bottom to top
     sm = stack_map(prs_now)
     tops = [n for n, i in sm.items() if not i["children"]]
-    shown = set()
+    shown, stack_lines = set(), []
     for top in sorted(tops):
         chain = sm[top]["below"] + [top]
         if len(chain) < 2 or tuple(chain) in shown:
             continue
         shown.add(tuple(chain))
-        asms = [(x, (load_draft(a.repo, x) or {}).get("assessment") or {}) for x in chain]
+        layer_drafts = [(x, drafts.get(x) or load_draft(a.repo, x) or {}) for x in chain]
+        asms = [(x, dd.get("assessment") or {}) for x, dd in layer_drafts]
         one_way = [f"#{x}" for x, m in asms if m.get("door") == "one-way"]
         scores = [m["rubberstamp"] for _, m in asms if isinstance(m.get("rubberstamp"), int)]
         bits = [" -> ".join(f"#{x}" for x in chain)]
@@ -1201,11 +1375,15 @@ def cmd_digest(a):
         missing = [f"#{x}" for x, m in asms if not m]
         if missing:
             bits.append(f"not scored: {', '.join(missing)}")
-        print("Stack  " + "  ·  ".join(bits))
+        latest = max((dd for _, dd in layer_drafts if dd.get("stack_summary")), key=lambda dd: dd.get("created_at", ""), default=None)
+        stack_lines.append("  " + "  ·  ".join(bits) + (f"\n         what: {latest['stack_summary'].strip()}" if latest else ""))
+    if stack_lines:
+        print("Stacks")
+        print("\n".join(stack_lines) + "\n")
 
     pairs = overlap_pairs(open_prs_with_files(a.repo))
     if pairs:
-        print("\nOverlapping PRs (same files, different stacks)")
+        print("Overlapping PRs (same files, different stacks)")
         for p in pairs[:5]:
             print(f"  #{p['a']} <-> #{p['b']}  {len(p['shared'])} shared: {', '.join(p['shared'][:3])}")
         if len(pairs) > 5:
@@ -1230,7 +1408,13 @@ def cmd_report(a):
         cs = d["review"].get("comments", [])
         where = "pending on GitHub" if d.get("status") == "staged" else d.get("status")
         print(f"## #{d['pr']} {d.get('title', '')}  ({label_counts(d)}; {where})\n")
+        if d.get("change_summary"):
+            print(f"What it does: {d['change_summary'].strip()}\n")
+        if d.get("stack_summary"):
+            print(f"The whole stack: {d['stack_summary'].strip()}\n")
         print(local_report(d))
+        for item in (d.get("assessment") or {}).get("look_at", []):
+            print(f"Look at: {item}")
         if d.get("notes_for_me"):
             print(f"\nNotes: {d['notes_for_me'].strip()}")
         print("\n---\n")

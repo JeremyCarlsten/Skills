@@ -1,6 +1,6 @@
 ---
 name: review-prs
-description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Drafts wait as the user's private pending review on GitHub; nothing is submitted until they approve. Built to run under /loop alongside a Ralph loop (waits for CI and settled branches, flags merge-ready and risky PRs, checks earlier comments were fixed, spots overlapping PRs and repeating findings). Can also review a single PR by number or URL. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
+description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Drafts wait as the user's private pending review on GitHub; nothing is submitted until they approve. Built to run under /loop alongside a Ralph loop (waits for CI and settled branches, flags merge-ready and risky PRs, checks earlier comments were fixed, judges other reviewers' comments with 👍 or 👎, spots overlapping PRs and repeating findings). Can also review a single PR by number or URL. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
 ---
 
 # Review PRs
@@ -33,25 +33,25 @@ Where things live (`prs.py path REPO` prints both):
 
 | Command | What it does |
 |---|---|
-| `scan REPO [--pr N]` | Lists open PRs and what each needs: `review`, `re-review`, `reply`, or a `skip_reason`. Holds reviews while CI is running or red, or the branch is still getting commits (see "Keeping up with a Ralph loop"). Marks stacked PRs and spots rebase-only changes. Skips drafts and bot PRs. Skips reviewing the user's own PRs unless `--include-own` is passed, but always surfaces comments waiting on them there. |
-| `fetch REPO N` | Writes `pr.json`, `diff.patch`, `comments.json`, `waiting.json` (comments needing a reply), `issues.json` (linked issues), `my_open_threads.json` (the user's unresolved review threads, for checking fixes), `overlaps.json` (other open PRs touching the same files) and an `incremental.patch` if this is a re-review. Checks the PR head out in a worktree. Prints the paths, including `write_draft_to`. |
-| `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. Also logs the review's labelled comments for `trends`. |
+| `scan REPO [--pr N]` | Lists open PRs and what each needs: `review`, `re-review`, `reply`, `validate`, or a `skip_reason`. Holds reviews while CI is running or red, or the branch is still getting commits (see "Keeping up with a Ralph loop"). Marks stacked PRs and spots rebase-only changes. Skips drafts and bot PRs. Skips reviewing the user's own PRs unless `--include-own` is passed, but always surfaces comments waiting on them there. |
+| `fetch REPO N` | Writes `pr.json`, `diff.patch`, `comments.json`, `waiting.json` (comments needing a reply), `issues.json` (linked issues), `my_open_threads.json` (the user's unresolved review threads, for checking fixes), `overlaps.json` (other open PRs touching the same files), `to_validate.json` (other reviewers' comments to judge) and an `incremental.patch` if this is a re-review. Checks the PR head out in a worktree. Prints the paths, including `write_draft_to`. |
+| `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. Also logs the review's labelled comments and verdicts for `trends`, and remembers which comments were judged. |
 | `show REPO [N]` | Prints pending drafts in readable form. |
-| `report REPO [N]` | The user's local read on each reviewed PR: summary, private take and the Merge Danger call. The take and the call are never posted. |
-| `digest REPO` | 🚨 PRs scoring 1-2, ✅ merge-ready PRs, then one line per pending draft (riskiest first), one line per stack, and overlapping PRs. |
+| `report REPO [N]` | The full local read on each reviewed PR: change and stack summary, any posted summary with its evidence, private take, Merge Danger call and look-at items. Only the summary is ever posted. |
+| `digest REPO` | Every reviewed PR sorted into 🚨 Needs you, 👀 Your call, 👍 Skim and approve or ✅ Merge-ready, with a one-line summary and next commands; then replies waiting, stacks with their whole-stack summary, and overlapping PRs. |
 | `overlaps REPO [N]` | Open PRs that change the same files, not counting PRs in the same stack. |
-| `trends REPO [--days 30] [--min-prs 3]` | ❌ and 💡 findings grouped by category, where the same category shows up across several PRs. |
+| `trends REPO [--days 30] [--min-prs 3]` | How other reviewers' comments held up (👍/👎 per author), then ❌ and 💡 findings grouped by category where the same category shows up across several PRs. |
 | `config REPO [KEY [VALUE]]` | Shows or sets `settle_minutes` (default 15) and `review_red` (default false). |
 | `stage REPO N\|all [--dry-run]` | Creates the review on GitHub as the user's pending (unsubmitted) review, with thread replies attached. Only the user can see it until they submit it. |
 | `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts, or submits a staged review. Refuses to post a review if the PR moved since it was drafted. |
-| `approve REPO N[,N] [--dry-run]` | Same as `post`, but the review goes in as an approval (with the summary as its comment, if there is one). |
+| `approve REPO N[,N] [--dry-run]` | Same as `post`, but the review goes in as an approval (no comment). Refuses a draft that has any ❌ finding. |
 
 Run `gh auth status` once at the start. If it fails, tell the user to run `gh auth login` and stop.
 
 ## One pass
 
 1. `scan REPO`. Work through PRs that have actions, oldest first. Don't announce skipped PRs one by one; they go in the digest.
-2. Work bottom-up through stacks (see "Stacked PRs"). For each PR: `fetch REPO N`, then do the review (below) and/or the replies, write the draft, then `mark`, then `stage` it on GitHub unless the user passed `--local`.
+2. Work bottom-up through stacks (see "Stacked PRs"). For each PR: `fetch REPO N`, then do the review (below), the replies and the verdicts on other reviewers' comments (see "Validating other reviewers' comments"), write the draft, then `mark`, then `stage` it on GitHub unless the user passed `--local`.
 3. End with the digest (below). If a PR scored 1 or 2 this pass, also send an alert (see "Alerts").
 
 Keep each PR self-contained: read what `fetch` wrote, work in that PR's worktree, finish its draft, then move on. If there are more than ~4 PRs to review and you can spawn subagents, hand each PR to its own subagent with this skill's path, the repo, the PR number and the fetch output, and have it write the draft file and return a two-line summary. That keeps one big PR from crowding out the rest.
@@ -94,7 +94,7 @@ Then a space, then the comment: `❌ This queries invoices once per customer...`
 - The repo's own consistent conventions beat textbook advice.
 - Skip anything a linter, formatter or type checker in the repo already enforces.
 - Every finding points at a line in the diff, plus the existing code, doc or spec it's measured against. No evidence, no comment.
-- Don't repeat what another reviewer (a person or a bot like CodeRabbit or Copilot) already said in `comments.json`. If their comment raises one of your findings, add it to the draft's `agree` list instead: that puts a 👍 on their comment, which flags it as worth looking into. Only agree with comments you checked and actually agree with, and only inline review comments or conversation comments (GitHub can't react to a review summary; mention those in `private_take`).
+- Don't repeat what another reviewer (a person or a bot like CodeRabbit or Copilot) already said. Their comments get judged separately (see "Validating other reviewers' comments"); if one raises your finding and is judged valid, its 👍 covers it.
 - If the PR is fine, say so in one line.
 
 ### Comments agents can act on
@@ -140,9 +140,29 @@ What changes when reviewing a layer:
 
 **Restacks.** When a lower layer changes, every layer above gets rebased and gets a new head SHA even though its own changes didn't change. `scan` catches this by comparing the layer's diff fingerprint (`git patch-id`) and marks it `rebased_only` instead of asking for a re-review, so restacks don't trigger a wave of duplicate reviews. If a draft is pending when that happens, `stage` and `post` move the review onto the new head automatically, as long as the commented lines are identical; otherwise it asks for a re-review.
 
+## Validating other reviewers' comments
+
+Other reviewers (people, and bots like CodeRabbit or Copilot) leave a lot of comments on agent PRs, and plenty are wrong. Each pass judges the ones that haven't been judged yet and marks them so the author and the loop know which to act on: 👍 valid, 👎 invalid.
+
+`fetch` writes `to_validate.json`: root comments of unresolved inline threads, non-empty review summaries, and conversation comments from bots, by anyone but the user, not judged before. `scan` shows `validate` when a PR has new ones, even with no new commits.
+
+**Two sides, then a decision.** For each PR with comments to validate, spawn two subagents in parallel, each given the skill path, `to_validate.json`, the worktree, `diff.patch`, the spec (`pr.json`, `issues.json`) and the repo's docs:
+- **Reviewer's advocate:** make the strongest case that each comment is right. Point at the code, spec or doc that backs it, and say what goes wrong if it's ignored.
+- **Devil's advocate:** make the strongest case that each comment is wrong, not worth doing, or already handled: the code doesn't do what it claims, it's handled elsewhere, it contradicts the spec or a repo convention, the cost outweighs the gain, or it's style the repo doesn't follow.
+
+Each returns, per comment id: its position, its best argument, the evidence (`file:line` or a spec/doc quote) and how confident it is. Ask for under ~300 words each. Then you decide each one:
+- **valid**: the advocate's case holds up with evidence and the devil's objections are answered. 👍.
+- **invalid**: the devil shows with evidence that it's wrong, already handled or not worth doing. 👎.
+- **unsure**: neither side makes its case with evidence. No reaction; say what's unclear in `why` and mention it in `private_take`.
+- **skip**: not a review claim (a deploy notice, a thank-you, a plain question). No reaction; it's just marked as judged.
+
+Write the decision and a one-line `why` with the evidence into `verdicts`, so the user can back it up. Don't let a 👍 stand in for your own finding when your finding is stronger; and a valid ❌-level comment still counts toward the score. Without subagents, argue both sides yourself, in writing, before deciding.
+
+The reactions go on only when the user runs `post`/`approve`, or on the next pass after they submit the staged review on GitHub. A 👎 is public, so only give one when the evidence is solid; otherwise it's `unsure`. `trends` also shows how each reviewer's comments have held up (👍/👎 counts per author), which tells you which bots are worth listening to.
+
 ## Merge Danger
 
-Every review comes with a Merge Danger call, in the same shape as the `/pr` skill's PR body (Matt Pocock's skills library, credited to Dex Horthy's show-me skill), so author and reviewer speak the same language. Put it in the draft's `assessment`. It's for the user, not the PR: it's shown locally (`report`, `show`, the digest) and never posted to GitHub. The PR body already has the author's door and blast radius; if yours differs, say so plainly in the posted summary or a ❓ comment ("This adds a migration, so I don't think it's reversible by revert") without using the Merge Danger labels or a score.
+Every review comes with a Merge Danger call, in the same shape as the `/pr` skill's PR body (Matt Pocock's skills library, credited to Dex Horthy's show-me skill), so author and reviewer speak the same language. Put it in the draft's `assessment`. It's for the user, not the PR: it's shown locally (`report`, `show`, the digest) and never posted to GitHub. The PR body already has the author's door and blast radius; if yours differs, say so plainly in a ❓ comment on the line that shows it (or, if it's blocking and there's no line to hang it on, the summary) ("This adds a migration, so I don't think it's reversible by revert") without using the Merge Danger labels or a score.
 
 **Check the author's claim first.** PRs from the factory usually carry their own `## Merge Danger` section and an `## Evidence` section in the body (`pr.json`). Read them. If your call differs from theirs (they said two-way, you see a migration), say so in the review body, because a wrong self-assessment is exactly what lets a risky PR get rubber-stamped. If the Evidence is a test that's tautological, say that too.
 
@@ -159,6 +179,8 @@ Every review comes with a Merge Danger call, in the same shape as the `/pr` skil
 | 3 | Read it | Something needs a person's eyes: a ❌ comment, weak or tautological tests on the logic that matters, a radius beyond one feature, or any one-way door. |
 | 2 | Review closely | A one-way door with open questions, or an architecture, spec or serious performance problem. |
 | 1 | Don't merge as is | A security hole, a data-loss or bad-data risk, a contradiction of the spec, or a one-way door that looks wrong. |
+
+**The middle ground (3/5, no ❌).** Some PRs have nothing for the author to fix but still shouldn't be stamped blind: a one-way door built exactly as the spec says, a wide blast radius, tests that don't really prove the risky part. Don't invent comments to justify the score, and don't push it down to 2. Score it 3 and fill `look_at` with the one to three specific things the user should check or decide ("Is a new table OK, or should this live in settings JSON? migrations/0042.sql"). The digest puts these under 👀 Your call. `stage` and `post` refuse a 3/5 with no ❌ and no `look_at`.
 
 Caps: a one-way door is never above 3, because it deserves a deliberate yes (the script enforces this). A ❌ for security or a spec contradiction is never above 2. `rubberstamp_reason` is one plain sentence naming what drove the score.
 
@@ -185,10 +207,13 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
   "pr": 42,
   "title": "Add invoices endpoints",
   "head_sha": "<head SHA from fetch>",
+  "change_summary": "Local only. One or two plain sentences on what the PR does, so the user knows what they're looking at. Under 300 characters.",
+  "stack_summary": "Local only, stacked PRs only. One or two sentences on what the whole stack does and which layer does what. Repeat it in every layer you draft; the digest shows the newest one.",
   "created_at": "<ISO time>",
   "status": "pending",
   "review": {
-    "body": "Posted as the review summary: one to three sentences in the user's voice on the overall take and the one or two things that matter most. No door, blast radius or score; the PR body already has its own Merge Danger section.",
+    "body": "Usually empty. Only for a blocking issue that can't be an inline comment (it's outside the diff, or it's about the PR as a whole). Starts with ❌, one to three sentences in the user's voice. No door, blast radius or score.",
+    "summary_reason": "Required whenever body isn't empty. Local only: the evidence behind the summary so the user can back it up if challenged. Files and lines, the spec or doc line, what you checked and how.",
     "private_take": "Local only, never posted: blunt notes for the user on how well the PR is written and whether the PR's own Merge Danger call holds up.",
     "comments": [
       { "path": "src/routes/invoices.js", "line": 9, "category": "spec", "body": "❌ ..." },
@@ -201,62 +226,90 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
     "blast_radius": "data",
     "blast_note": "Existing invoices get a default due date that may be wrong.",
     "rubberstamp": 2,
-    "rubberstamp_reason": "The migration is a one-way door and the backfill default isn't in the spec."
+    "rubberstamp_reason": "The migration is a one-way door and the backfill default isn't in the spec.",
+    "look_at": ["Required for a 3/5 with no ❌: the one to three specific things the user should check or decide, each with the file or question."]
   },
   "replies": [
     { "kind": "review_comment", "reply_to": 123456, "to": "alice", "context": "what they said, short", "body": "..." },
     { "kind": "issue_comment", "to": "bob", "context": "...", "body": "..." },
     { "kind": "review_comment", "reply_to": 654321, "thread_id": "PRRT_abc", "resolve": true, "to": "alice", "context": "my earlier ❌ on the N+1 query", "body": "Fixed in a1b2c3d." }
   ],
-  "agree": [
-    { "kind": "review_comment", "id": 777001, "author": "coderabbitai", "path": "src/dashboard.ts", "line": 42,
-      "why": "Same N+1 query I found.", "category": "performance", "severity": "❌" }
+  "verdicts": [
+    { "kind": "review_comment", "id": 777001, "author": "coderabbitai[bot]", "path": "src/dashboard.ts", "line": 42,
+      "verdict": "valid", "why": "findByCustomer runs once per row, so 500 rows is 500 queries.", "category": "performance", "severity": "❌" },
+    { "kind": "review", "id": 88001, "node_id": "PRR_kwDO...", "author": "copilot-pull-request-reviewer[bot]",
+      "verdict": "invalid", "why": "Says the cap breaks the 5mm spec, but the spec allows per-pocket overrides (docs/specs/pockets.md:12)." }
   ],
   "notes_for_me": "Things for the user only: decisions to make, low-confidence findings, anything you left out and why."
 }
 ```
 
-- `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment; `stage` and `post` refuse one without it.
+- `review` and `assessment` are `null` when there's no review this pass (own PR, or only replies needed). Every review needs an assessment and a `change_summary`; `stage` and `post` refuse one without them. In a stack, every layer you draft also gets the `stack_summary`.
 - Inline comment `line` numbers are lines in the PR head version of the file (RIGHT side) and must fall inside a diff hunk, or GitHub rejects the review. Check against `diff.patch`. If a point is about code outside the diff, put it in the review body instead.
 - For `review_comment` replies, `reply_to` is the thread's root comment ID (`reply_to` in `waiting.json`).
-- `agree` entries use the other comment's numeric `id` from `comments.json` (`review_comments` → `review_comment`, `issue_comments` → `issue_comment`). `severity` is the label you'd have given it (❌ or 💡) and `category` is one of the comment categories, so agreed findings still count in `trends`.
-- What goes to GitHub: the short text summary (`review.body`), the inline comments and the thread replies. What stays local: `private_take` and the whole Merge Danger call. The PR body already carries its own door and blast radius, and rubberstampability is for the user only. `stage` and `post` refuse a summary or comment that mentions door, blast radius or rubberstampability.
+- `verdicts` entries copy `kind`, `id`, `author`, `path`/`line` and, for reviews, `node_id` from `to_validate.json`. `verdict` is `valid`, `invalid`, `unsure` or `skip`; `why` is one plain sentence with the evidence. For valid ones, `severity` (❌ or 💡) and `category` make them count in `trends`.
+- **Prefer no summary.** Inline comments carry the review. Leave `review.body` empty unless there's a blocking issue with no line in the diff to attach it to; then start it with ❌ and fill `summary_reason` with the evidence. `stage` and `post` refuse a summary that doesn't start with ❌ or has no `summary_reason`. A clean PR gets no comment at all; the user can `approve` it.
+- What goes to GitHub: the summary (rare, blocking only), the inline comments and the thread replies. What stays local: `summary_reason`, `private_take` and the whole Merge Danger call. The PR body already carries its own door and blast radius, and rubberstampability is for the user only. `stage` and `post` refuse a summary or comment that mentions door, blast radius or rubberstampability.
 - Reviews post as a plain comment review. Approve only when the user names the PR (`approve 42`, "approve and post 42"); never request changes unless they ask.
 
 Then: `mark REPO N --sha <head_sha> --comments <every id from waiting.json you handled or deliberately skipped>`.
 
 ## The digest
 
-End every pass with your local read on each PR reviewed this pass: run `report REPO N` for each and print it (the posted summary, your private take on how well the PR is written, Door, Blast Radius, Rubberstampability, notes). The private take and Merge Danger call never go on GitHub. Then the digest: run `digest REPO` for the pending-drafts table (riskiest first) and put your one-line notes on what's new this pass above it:
+End every pass with `digest REPO`, with your one-line notes on what's new this pass above it. The digest sorts every reviewed PR into what the user should do with it:
+
+| Tier | Who lands there | What the user does |
+|---|---|---|
+| 🚨 Needs you | Score 1-2, or any ❌ (inline or summary) | Read the why and any evidence, then post the review so the loop fixes it. |
+| 👀 Your call | 3/5 with no ❌: nothing for the author to fix, but a person should decide (a one-way door that looks right, a wide blast radius, weak test evidence on logic that matters) | Check the `look_at` items, then approve or ask a ❓. |
+| 👍 Skim and approve | 4/5, or 5/5 still waiting on CI | Skim, approve. |
+| ✅ Merge-ready | 5/5, no ❌, CI green, reviewed at the current head | Approve. |
+
+Every PR shows door, blast radius, score, comment counts, CI, where the draft is, a one-line `what:` (the change summary) and the next commands. PRs whose head moved since the review are listed as changed and picked up next pass. Stacks get a line each with the whole-stack summary.
 
 ```
 review-prs · owner/repo · 14:32
 New this pass
   #42  drafted review, PR body says two-way but it adds a migration
-  #57  drafted 2 replies on your PR
   #38  re-review: 2 of 3 ❌ fixed and resolved, 1 still open
-🚨 Needs you
-  #42    Add invoices endpoints        2/5  The migration is a one-way door and the backfill isn't in the spec.
-✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)
+
+🚨 Needs you (score 1-2, or a ❌ for the author)
+  #42    Add invoices endpoints
+         one-way · data · 2/5 · ❌2 💡1 👍1 👎2 · CI passing · on GitHub, not submitted
+         what: Adds invoice create/list endpoints and a due_date column with a backfill.
+         why: The migration is a one-way door and the backfill default isn't in the spec.
+         -> read on GitHub (https://github.com/owner/repo/pull/42#pullrequestreview-...)
+
+👀 Your call (3/5, nothing for the author to fix, but a person should decide)
+  #47    Persist pocket presets
+         one-way · data · 3/5 · ❓1 · CI passing · local draft
+         what: Saves pocket presets to a new presets table instead of local storage.
+         why 3/5: New table and storage format, done the way the spec asks.
+         look at: Is a new presets table OK, or should this live in the existing settings JSON? (migrations/0042.sql)
+         look at: Existing local-storage presets aren't migrated; fine for now?
+         -> post 47 · approve 47
+
+✅ Merge-ready (5/5, no ❌, CI green)
   #61    Field card spacing
-💬 Summary only, no inline comments
-  #61    Field card spacing  (5/5)
-         "Looks good to me. Spacing matches the other cards."
-         -> approve 61  ·  post 61 (comment only)
-Pending drafts, riskiest first
-  #42    Add invoices endpoints        one-way · data · 2/5  ·  ❌2 💡1 ⛏️1 👍1  ·  1 replies
-  #61    Field card spacing            two-way · contained · 5/5  ·  no comments
-  #57    Fix login redirect                                        ·  2 replies
-Stack  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
+         two-way · contained · 5/5 · no comments · CI passing · local draft
+         what: Evens out the padding on field cards to match the design tokens.
+         -> approve 61
+
+💬 Replies waiting
+  #57    Fix login redirect                                 2 replies  -> show 57 · post 57
+
+Stacks
+  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
+         what: Adds invoicing: #41 the table, #42 the service and endpoints, #43 the dashboard card.
+
 Overlapping PRs (same files, different stacks)
   #44 <-> #49  2 shared: src/pocket/radius.ts, src/pocket/types.ts
 Held: 2 waiting for CI, 1 CI failing, 3 still settling
 Repeating: tautological-test in 4 PRs this month (`trends` for details)
 Skipped: 3 drafts, 1 bot, 4 with nothing new, 2 rebased only
-Next: read the staged ones on GitHub (Files changed tab), `show` for the rest, `post 42` or `post all` to send.
 ```
 
-Build the Held line from the `skip_reason`s in `scan`. For the Repeating line, run `trends REPO --days 30` each pass (it's a local file read) and mention any category at 3+ PRs. If nothing needed doing and nothing is urgent or merge-ready, one line: `review-prs · owner/repo · nothing new.`
+Build the Held line from the `skip_reason`s in `scan`. For the Repeating line, run `trends REPO --days 30` each pass (it's a local file read) and mention any category at 3+ PRs. `report REPO N` prints the full local read for one PR (summary and evidence, private take, Merge Danger call, look-at items) when the user wants more than the digest line. If nothing needed doing and nothing is waiting, one line: `review-prs · owner/repo · nothing new.`
 
 ## Keeping up with a Ralph loop
 
@@ -279,11 +332,12 @@ When the user asks for trends (or a "factory report"), run `trends REPO`, read t
 
 ## Staging on GitHub
 
-By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the short summary, the inline comments and the replies to review threads show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
+By default, after a pass writes a draft, run `stage REPO N` for it. That puts the review on the PR as the user's **pending review**: the inline comments, the replies to review threads and any blocking summary show up on the PR's Files changed tab, marked Pending, and nobody but the user can see them. The user reads them in context, edits or deletes anything right there, and submits with "Finish your review" (or says `post 42`, which submits it as a plain comment review). The draft's `staged_url` links to it.
 
 Things to know:
-- **👍 reactions can't be pending.** They go on when the user runs `post`/`approve`, or on the next pass after they submit the staged review on GitHub.
-- **Summary-only reviews aren't staged.** When a review has a summary but no inline comments, a pending review would just hide one sentence behind "Finish your review". It stays local and shows up in the digest's 💬 section with the summary text, so the user can say `approve 42` or `post 42` in one step.
+- **👍/👎 reactions can't be pending.** They go on when the user runs `post`/`approve`, or on the next pass after they submit the staged review on GitHub.
+- **A blocking summary with no inline comments isn't staged.** A pending review would just hide it behind "Finish your review". It stays local and shows under 🚨 in the digest with the summary and its evidence, so the user can check the claim and `post 42`.
+- **A clean PR puts nothing on GitHub.** It shows in the ✅ merge-ready list with `approve 42`.
 - **Conversation replies can't be staged.** GitHub can only hold inline comments and review-thread replies as pending. Replies to top-level conversation comments stay local; `show` lists them and `post` sends them.
 - **One pending review per person per PR.** If the user already has their own pending review going on a PR, `stage` refuses rather than touching it, and says so. Leave that draft local and mention it in the digest.
 - **Re-staging replaces.** After a re-review, `stage` deletes the earlier pending review it made and creates the new one. It never deletes a pending review it didn't make.

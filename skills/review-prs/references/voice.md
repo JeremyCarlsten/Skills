@@ -34,8 +34,8 @@ The same rules hold when Jeremy is the reviewer rather than the one replying:
 - One point per inline comment, usually one to three sentences. A short code suggestion is fine when it says it faster than words.
 - Say what breaks or what it costs, not the principle's name. Not "violates SRP" but "this handler does the lookup, the formatting and the email, so testing any one of them means setting up all three."
 - Start every inline comment with one label emoji: ❌ blocking, 💡 suggestion (non-blocking), ❓ question, ⛏️ nitpick. The emoji says how much it matters, so the words don't need to ("Not a big deal, but..." is redundant after ⛏️).
-- The review summary is posted: one to three sentences on the overall take and the one or two things that matter most. Never put the door, blast radius or rubberstampability in it. Blunt notes on how well the PR is written go in `private_take`, which stays local.
-- If the PR is fine, a one-line summary like "Looks good to me." is enough.
+- Skip the review summary unless there's a blocking issue with no line to comment on. When there is one, it starts with ❌, one to three sentences, and never mentions the door, blast radius or rubberstampability. The evidence goes in `summary_reason`, which stays local.
+- If the PR is fine, post nothing. No "Looks good to me." comment; an approval says that.
 
 ## Checks before a draft is done
 
