@@ -1,6 +1,6 @@
 ---
 name: review-prs
-description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Drafts wait as the user's private pending review on GitHub; nothing is submitted until they approve. Built to run under /loop. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
+description: Sweep a GitHub repo's open pull requests and draft big-picture reviews (spec contradictions, architecture, security, one-way doors, things that make future agent work harder, tautological tests, serious performance) with a Merge Danger call (door, blast radius, rubberstampability 1-5), stacked-PR aware, plus replies to comments waiting on the user in their plain-spoken voice. Drafts wait as the user's private pending review on GitHub; nothing is submitted until they approve. Built to run under /loop alongside a Ralph loop (waits for CI and settled branches, flags merge-ready and risky PRs, checks earlier comments were fixed, spots overlapping PRs and repeating findings). Can also review a single PR by number or URL. Use for /review-prs, "review the open PRs on X", "check my PRs", "answer the comments on my PRs", or posting approved PR drafts.
 ---
 
 # Review PRs
@@ -9,12 +9,16 @@ Go through the open PRs on one GitHub repo, review the ones that changed, and dr
 
 Invocation:
 - `/review-prs owner/repo` — one pass.
+- `/review-prs owner/repo 567`, `/review-prs owner/repo#567` or a PR URL — review that one PR now. Pass `--pr 567` to `scan` (or the URL as REPO). A PR asked for by number skips the CI and settle checks and is reviewed again even if nothing changed.
 - `/review-prs owner/repo --mine` — also review PRs the user opened ("include my PRs" means the same). Pass `--include-own` to `scan`. Under `/loop`, the flag rides along in the loop prompt, so `/loop /review-prs owner/repo --mine` keeps it on.
 - `/loop /review-prs owner/repo` — keep watching (see "Loop mode").
 - `/review-prs owner/repo --local` — keep drafts on this machine only; don't stage them on GitHub.
 - `/review-prs owner/repo stage 42` · `stage all` — put drafts on GitHub as the user's pending review (see "Staging on GitHub").
 - `/review-prs owner/repo post 42` · `post 42,57` · `post all` — post approved drafts, or submit staged ones.
 - `/review-prs owner/repo show` — print pending drafts.
+- `/review-prs owner/repo trends` — findings that keep repeating across PRs, and what to change in the factory to stop them.
+- `/review-prs owner/repo overlaps` — open PRs that touch the same files.
+- `/review-prs owner/repo config settle_minutes 30` · `config review_red true` — change how patient a pass is.
 
 If no repo is given, use the current directory's GitHub remote (`gh repo view --json nameWithOwner -q .nameWithOwner`). If that fails, ask.
 
@@ -24,12 +28,15 @@ If no repo is given, use the current directory's GitHub remote (`gh repo view --
 
 | Command | What it does |
 |---|---|
-| `scan REPO` | Lists open PRs and what each needs: `review`, `re-review`, `reply`, or a `skip_reason`. Marks stacked PRs and spots rebase-only changes. Skips drafts and bot PRs. Skips reviewing the user's own PRs unless `--include-own` is passed, but always surfaces comments waiting on them there. |
-| `fetch REPO N` | Writes `pr.json`, `diff.patch`, `comments.json`, `waiting.json` (comments needing a reply), `issues.json` (linked issues), and an `incremental.patch` if this is a re-review. Checks the PR head out in a worktree. Prints the paths, including `write_draft_to`. |
-| `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. |
+| `scan REPO [--pr N]` | Lists open PRs and what each needs: `review`, `re-review`, `reply`, or a `skip_reason`. Holds reviews while CI is running or red, or the branch is still getting commits (see "Keeping up with a Ralph loop"). Marks stacked PRs and spots rebase-only changes. Skips drafts and bot PRs. Skips reviewing the user's own PRs unless `--include-own` is passed, but always surfaces comments waiting on them there. |
+| `fetch REPO N` | Writes `pr.json`, `diff.patch`, `comments.json`, `waiting.json` (comments needing a reply), `issues.json` (linked issues), `my_open_threads.json` (the user's unresolved review threads, for checking fixes), `overlaps.json` (other open PRs touching the same files) and an `incremental.patch` if this is a re-review. Checks the PR head out in a worktree. Prints the paths, including `write_draft_to`. |
+| `mark REPO N --sha SHA --comments ID ...` | Records that the head SHA was reviewed and those comment IDs were handled, so the next pass skips them. Also logs the review's labelled comments for `trends`. |
 | `show REPO [N]` | Prints pending drafts in readable form. |
 | `report REPO [N]` | The user's local read on each reviewed PR: summary, private take and the Merge Danger call. The take and the call are never posted. |
-| `digest REPO` | One line per pending draft with door, blast radius and score, riskiest first, then one line per stack. |
+| `digest REPO` | 🚨 PRs scoring 1-2, ✅ merge-ready PRs, then one line per pending draft (riskiest first), one line per stack, and overlapping PRs. |
+| `overlaps REPO [N]` | Open PRs that change the same files, not counting PRs in the same stack. |
+| `trends REPO [--days 30] [--min-prs 3]` | ❌ and 💡 findings grouped by category, where the same category shows up across several PRs. |
+| `config REPO [KEY [VALUE]]` | Shows or sets `settle_minutes` (default 15) and `review_red` (default false). |
 | `stage REPO N\|all [--dry-run]` | Creates the review on GitHub as the user's pending (unsubmitted) review, with thread replies attached. Only the user can see it until they submit it. |
 | `post REPO N\|all [--dry-run] [--only review\|replies]` | Posts approved drafts, or submits a staged review. Refuses to post a review if the PR moved since it was drafted. |
 
@@ -39,7 +46,7 @@ Run `gh auth status` once at the start. If it fails, tell the user to run `gh au
 
 1. `scan REPO`. Work through PRs that have actions, oldest first. Don't announce skipped PRs one by one; they go in the digest.
 2. Work bottom-up through stacks (see "Stacked PRs"). For each PR: `fetch REPO N`, then do the review (below) and/or the replies, write the draft, then `mark`, then `stage` it on GitHub unless the user passed `--local`.
-3. End with the digest (below).
+3. End with the digest (below). If a PR scored 1 or 2 this pass, also send an alert (see "Alerts").
 
 Keep each PR self-contained: read what `fetch` wrote, work in that PR's worktree, finish its draft, then move on. If there are more than ~4 PRs to review and you can spawn subagents, hand each PR to its own subagent with this skill's path, the repo, the PR number and the fetch output, and have it write the draft file and return a two-line summary. That keeps one big PR from crowding out the rest.
 
@@ -73,7 +80,7 @@ Every inline comment starts with exactly one emoji so people and agents know at 
 | ❓ | Question | You need an answer before you can judge it, or you might be missing something. |
 | ⛏️ | Nitpick | Small polish: naming, dead code, minor KISS/SRP cleanups. `references/smells.md` has the heuristics. |
 
-Then a space, then the comment: `❌ This queries invoices once per customer...`. Use the emoji characters, not GitHub shortcodes, so they read the same in the terminal. Cap nitpicks at 5, and if there's nothing big, don't pad with ⛏️ to look busy. `stage` and `post` refuse a comment that doesn't start with one of the four.
+Then a space, then the comment: `❌ This queries invoices once per customer...`. Every ❌ and 💡 comment also gets a `category` field in the draft (not in the text): `spec`, `architecture`, `security`, `one-way-door`, `agent-friction`, `tautological-test`, `performance`, `correctness`, `simplify`, `reuse`, `naming` or `other`. That's what `trends` groups by. Use the emoji characters, not GitHub shortcodes, so they read the same in the terminal. Cap nitpicks at 5, and if there's nothing big, don't pad with ⛏️ to look busy. `stage` and `post` refuse a comment that doesn't start with one of the four.
 
 ### Ground rules
 
@@ -103,7 +110,14 @@ The fix block can be terse and technical; it isn't held to the voice guide's sen
 
 **The user's own PRs** (`own_pr` is true, only with `--mine`): same lenses and Merge Danger call. GitHub lets you post a comment review on your own PR, so it posts the same way. Write the comments as notes to the factory and to the user rather than to a teammate: what to change and why, still in the voice guide.
 
-**Re-reviews** (`incremental.patch` exists): review what changed since the last pass, check whether earlier findings were addressed, and update the assessment. If the branch was force-pushed, review the whole diff again but don't re-raise points already made.
+**Re-reviews** (`incremental.patch` exists): review what changed since the last pass and update the assessment. If the branch was force-pushed, review the whole diff again but don't re-raise points already made.
+
+**Checking fixes.** `my_open_threads.json` lists the user's unresolved review threads on the PR. On every re-review, go through the ❌ and 💡 ones and check the current code (the worktree and `incremental.patch`), not the thread's `outdated` flag, which only means the lines moved:
+- **Fixed:** draft a reply like "Fixed in a1b2c3d." (the short SHA of the commit that fixed it) with `"resolve": true` and the thread's `thread_id`. The thread gets resolved when the reply is posted or the staged review is submitted. Only do this when you saw the fix yourself.
+- **Partly fixed:** a one-sentence reply saying what's still missing, no `resolve`.
+- **Not touched:** no reply. List it in `private_take` ("❌ on src/a.ts:4 still open") so the user knows the loop skipped it, and keep it in mind for the score.
+
+**Other PRs in flight.** `overlaps.json` lists open PRs, outside this PR's stack, that change the same files. With a lot of agents working at once, check them for: the same thing being built twice, two competing patterns for one job (the next agent will copy whichever it sees), and changes that will conflict when both merge. If it's real, raise it as a ❓ or ❌ comment naming the other PR ("#571 adds its own `clampRadius` too. Should one of these go?"); if it's only a likely merge conflict, put it in `private_take`.
 
 ## Stacked PRs
 
@@ -171,8 +185,8 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
     "body": "Posted as the review summary: one to three sentences in the user's voice on the overall take and the one or two things that matter most. No door, blast radius or score; the PR body already has its own Merge Danger section.",
     "private_take": "Local only, never posted: blunt notes for the user on how well the PR is written and whether the PR's own Merge Danger call holds up.",
     "comments": [
-      { "path": "src/routes/invoices.js", "line": 9, "body": "..." },
-      { "path": "src/routes/invoices.js", "start_line": 15, "line": 26, "body": "..." }
+      { "path": "src/routes/invoices.js", "line": 9, "category": "spec", "body": "❌ ..." },
+      { "path": "src/routes/invoices.js", "start_line": 15, "line": 26, "body": "⛏️ ..." }
     ]
   },
   "assessment": {
@@ -185,7 +199,8 @@ Write one JSON file per PR at the `write_draft_to` path. Replace any older draft
   },
   "replies": [
     { "kind": "review_comment", "reply_to": 123456, "to": "alice", "context": "what they said, short", "body": "..." },
-    { "kind": "issue_comment", "to": "bob", "context": "...", "body": "..." }
+    { "kind": "issue_comment", "to": "bob", "context": "...", "body": "..." },
+    { "kind": "review_comment", "reply_to": 654321, "thread_id": "PRRT_abc", "resolve": true, "to": "alice", "context": "my earlier ❌ on the N+1 query", "body": "Fixed in a1b2c3d." }
   ],
   "notes_for_me": "Things for the user only: decisions to make, low-confidence findings, anything you left out and why."
 }
@@ -208,16 +223,44 @@ review-prs · owner/repo · 14:32
 New this pass
   #42  drafted review, PR body says two-way but it adds a migration
   #57  drafted 2 replies on your PR
+  #38  re-review: 2 of 3 ❌ fixed and resolved, 1 still open
+🚨 Needs you
+  #42    Add invoices endpoints        2/5  The migration is a one-way door and the backfill isn't in the spec.
+✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)
+  #61    Field card spacing
 Pending drafts, riskiest first
   #42    Add invoices endpoints        one-way · data · 2/5  ·  ❌2 💡1 ⛏️1  ·  1 replies
   #61    Field card spacing            two-way · contained · 5/5  ·  no comments
   #57    Fix login redirect                                        ·  2 replies
 Stack  #41 -> #42 -> #43  ·  one-way at #41  ·  lowest 2/5
+Overlapping PRs (same files, different stacks)
+  #44 <-> #49  2 shared: src/pocket/radius.ts, src/pocket/types.ts
+Held: 2 waiting for CI, 1 CI failing, 3 still settling
+Repeating: tautological-test in 4 PRs this month (`trends` for details)
 Skipped: 3 drafts, 1 bot, 4 with nothing new, 2 rebased only
 Next: read the staged ones on GitHub (Files changed tab), `show` for the rest, `post 42` or `post all` to send.
 ```
 
-If nothing needed doing, one line: `review-prs · owner/repo · nothing new.`
+Build the Held line from the `skip_reason`s in `scan`. For the Repeating line, run `trends REPO --days 30` each pass (it's a local file read) and mention any category at 3+ PRs. If nothing needed doing and nothing is urgent or merge-ready, one line: `review-prs · owner/repo · nothing new.`
+
+## Keeping up with a Ralph loop
+
+A Ralph loop opens and updates PRs faster than anyone can read them, so a pass is choosy about what it spends time on:
+
+- **Wait for CI and for the branch to settle.** `scan` holds a review (not replies) while CI is pending, while CI is red (the loop will usually fix it, so reviewing now is wasted work), and until the branch has had no new commits for `settle_minutes` (default 15). Held PRs are picked up on a later pass. Change with `config REPO settle_minutes 30` or `config REPO review_red true`. A PR the user asks for by number is never held.
+- **Merge-ready list.** The digest's ✅ section lists PRs reviewed at their current head with a 5/5, no ❌ and green CI: the ones the user can approve and move on from.
+- **Alerts.** See below.
+- **Fix the factory, not just the PR.** See "Trends".
+
+## Alerts
+
+When a pass drafts a review scoring 1 or 2, the user should hear about it without waiting for their next look. If a push-notification tool is available (for example `PushNotification`), send one short line per PR: `#42 Add invoices endpoints: 2/5, one-way migration not in the spec`. Otherwise the 🚨 section at the top of the digest is the alert. Don't alert on the same PR and head twice.
+
+## Trends
+
+Every reviewed comment is logged (`~/.review-prs/<repo>/findings.jsonl`). `trends` groups ❌ and 💡 findings by category and shows the ones that keep coming back across PRs. When the same problem shows up in three or more PRs, the fix belongs in the factory: a rule in `CLAUDE.md`, a line in the relevant skill (`/implement`, `/to-tickets`), a lint rule or a test helper.
+
+When the user asks for trends (or a "factory report"), run `trends REPO`, read the examples, look at the repo's current `CLAUDE.md` and agent docs, and write a short report to `~/.review-prs/<owner>__<repo>/factory-notes.md`: for each repeating category, what keeps going wrong (with PR links), and the exact text of the rule or change you'd add and where. Show it to the user. Don't edit the repo's docs or skills yourself; that's the user's call.
 
 ## Staging on GitHub
 
@@ -239,6 +282,7 @@ Only when the user asks (`post 42`, `post all`, "send the review on 42"). First 
 Under `/loop`, each firing is one pass. The state file makes passes cheap: PRs with no new commits and no new comments are skipped without fetching. Each pass:
 - Never submits or posts. It drafts, then stages new drafts as pending reviews on GitHub (unless `--local`), which only the user can see.
 - Doesn't re-draft a PR whose pending draft already covers the current head, unless new comments came in.
-- Keeps the digest short, and leaves out anything that was already in the previous digest and hasn't changed.
+- Keeps the digest short, and leaves out anything that was already in the previous digest and hasn't changed (the 🚨 and ✅ lists always show).
+- Holds reviews for PRs that are mid-CI, red or still getting commits.
 
 If the loop is self-paced (`/loop` with no interval), wait about 20–30 minutes between passes; PRs don't move faster than that, and a quiet pass costs little. If the user gave an interval (`/loop 30m ...`), that's the pacing.

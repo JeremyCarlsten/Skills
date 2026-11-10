@@ -18,7 +18,12 @@ Subcommands
   post  REPO N|all [--dry-run] [--only review|replies]   post approved drafts (submits staged ones)
   digest REPO                  one line per pending draft: door, blast radius, score
   report REPO [N]              your local read on each PR: overall take + Merge Danger (never posted)
+  overlaps REPO [N]            open PRs that touch the same files (not counting their own stack)
+  trends REPO [--days D]       findings that keep repeating across PRs (fix the factory, not the PR)
+  config REPO [KEY [VALUE]]    show or set settle_minutes, review_red
   path  REPO                    print the state directory
+
+REPO can also be a PR URL (https://github.com/owner/repo/pull/123); scan then looks at that PR only.
 
 Stdlib only. Requires `gh` (authenticated) and `git`.
 """
@@ -96,6 +101,57 @@ def draft_file(repo, n):
 def load_draft(repo, n):
     f = draft_file(repo, n)
     return json.loads(f.read_text(encoding="utf-8")) if f.exists() else None
+
+
+DEFAULTS = {"settle_minutes": 15, "review_red": False}
+CATEGORIES = {"spec", "architecture", "security", "one-way-door", "agent-friction", "tautological-test",
+              "performance", "correctness", "simplify", "reuse", "naming", "other"}
+
+
+def config(state):
+    return {**DEFAULTS, **state.get("config", {})}
+
+
+def pr_signals(repo):
+    """CI state and last commit time for every open PR, in one paged GraphQL query."""
+    owner, name = repo.split("/", 1)
+    q = ("query($o:String!,$r:String!,$c:String){repository(owner:$o,name:$r){pullRequests(states:OPEN,first:100,after:$c){"
+         "pageInfo{hasNextPage endCursor} nodes{number commits(last:1){nodes{commit{committedDate statusCheckRollup{state}}}}}}}}")
+    out, cursor = {}, None
+    while True:
+        args = ["api", "graphql", "-f", f"query={q}", "-F", f"o={owner}", "-F", f"r={name}"]
+        if cursor:
+            args += ["-f", f"c={cursor}"]
+        data = gh_json(args)
+        prs = data["data"]["repository"]["pullRequests"]
+        for node in prs["nodes"]:
+            commits = node["commits"]["nodes"]
+            c = commits[0]["commit"] if commits else {}
+            state = ((c.get("statusCheckRollup") or {}).get("state") or "").upper()
+            ci = {"SUCCESS": "passing", "PENDING": "pending", "EXPECTED": "pending",
+                  "FAILURE": "failing", "ERROR": "failing"}.get(state, "none")
+            out[node["number"]] = {"ci": ci, "last_commit": c.get("committedDate")}
+        if not prs["pageInfo"]["hasNextPage"]:
+            return out
+        cursor = prs["pageInfo"]["endCursor"]
+
+
+def minutes_since(iso):
+    if not iso:
+        return None
+    t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - t).total_seconds() / 60
+
+
+def parse_target(repo):
+    """Accept owner/repo or a PR URL. Returns (repo, pr_number_or_None)."""
+    m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", repo)
+    if m:
+        return m.group(1), int(m.group(2))
+    m = re.match(r"^([^/\s]+/[^/\s#]+)#(\d+)$", repo)
+    if m:
+        return m.group(1), int(m.group(2))
+    return repo, None
 
 
 # ---------------------------------------------------------------- comments
@@ -190,28 +246,42 @@ def cmd_scan(a):
                    "number,title,author,isDraft,headRefOid,baseRefName,headRefName,updatedAt,url"]) or []
     stacks = stack_map(prs)
     open_nums = {str(p["number"]) for p in prs}
+    cfg = config(state)
+    signals = pr_signals(repo)
+    only = getattr(a, "pr", None)
+    if only and str(only) not in open_nums:
+        sys.exit(f"PR #{only} is not open on {repo}")
     result = []
     for p in prs:
+        if only and p["number"] != only:
+            continue
         n = p["number"]
         author = p["author"]["login"]
         entry = {"number": n, "title": p["title"], "author": author, "url": p["url"],
                  "head_sha": p["headRefOid"], "actions": [], "skip_reason": None}
         if n in stacks:
             entry["stack"] = stacks[n]
-        if p["isDraft"] and not a.include_drafts:
+        sig = signals.get(n, {})
+        entry["ci"] = sig.get("ci", "none")
+        st0 = state["prs"].setdefault(str(n), {})
+        st0["ci"] = entry["ci"]
+        if p["isDraft"] and not a.include_drafts and not only:
             entry["skip_reason"] = "draft"
             result.append(entry)
             continue
-        if is_bot(p["author"]) and not a.include_bots:
+        if is_bot(p["author"]) and not a.include_bots and not only:
             entry["skip_reason"] = "bot author"
             result.append(entry)
             continue
         st = state["prs"].get(str(n), {})
         own = author.lower() == login.lower()
 
-        if not own or a.include_own:
+        if not own or a.include_own or only:
             prev = st.get("reviewed_sha")
-            if prev is None:
+            if only and prev == p["headRefOid"]:
+                entry["actions"].append("review")  # asked for by number: review again even if nothing changed
+                entry["forced"] = True
+            elif prev is None:
                 entry["actions"].append("review")
             elif prev != p["headRefOid"]:
                 # Restacked or rebased with the same changes? Then there's nothing to re-review.
@@ -223,6 +293,21 @@ def cmd_scan(a):
                 else:
                     entry["actions"].append("re-review")
                     entry["previous_sha"] = prev
+
+        # Ralph loops push a lot: wait for CI and for the branch to go quiet before reviewing.
+        wants_review = any(x in entry["actions"] for x in ("review", "re-review"))
+        if wants_review and not only:
+            quiet = minutes_since(sig.get("last_commit"))
+            hold = None
+            if entry["ci"] == "pending":
+                hold = "waiting for CI"
+            elif entry["ci"] == "failing" and not cfg["review_red"]:
+                hold = "CI failing, waiting for the loop to fix it"
+            elif quiet is not None and quiet < cfg["settle_minutes"]:
+                hold = f"still settling (last commit {int(quiet)}m ago)"
+            if hold:
+                entry["actions"] = [x for x in entry["actions"] if x not in ("review", "re-review")]
+                entry["held"] = hold
 
         seen = set(st.get("seen_comment_ids", []))
         ic = gh_paged(f"repos/{repo}/issues/{n}/comments")
@@ -240,11 +325,12 @@ def cmd_scan(a):
             entry["pending_draft"] = True
             # A pending draft for this same head and no new comments: nothing to do.
             same = d.get("head_sha") == p["headRefOid"] or entry.get("rebased_only")
-            if same and "reply" not in entry["actions"] and "re-review" not in entry["actions"]:
+            if same and "reply" not in entry["actions"] and "re-review" not in entry["actions"] and not entry.get("forced"):
                 entry["actions"] = []
                 entry["skip_reason"] = "draft already waiting for you"
         if not entry["actions"] and not entry["skip_reason"]:
-            entry["skip_reason"] = ("rebased, same changes" if entry.get("rebased_only")
+            entry["skip_reason"] = (entry["held"] if entry.get("held")
+                                    else "rebased, same changes" if entry.get("rebased_only")
                                     else "own PR, no new comments" if own else "nothing new since last pass")
         result.append(entry)
 
@@ -255,8 +341,51 @@ def cmd_scan(a):
             num = d.name.replace("pr-", "")
             if num not in open_nums:
                 run(["git", "-C", str(home(repo) / "clone"), "worktree", "remove", "--force", str(d)], check=False)
-    print(json.dumps({"repo": repo, "me": login, "scanned_at": now(), "prs": result}, indent=2))
+    print(json.dumps({"repo": repo, "me": login, "scanned_at": now(), "config": cfg, "prs": result}, indent=2))
     save_state(repo, state)
+
+
+# ---------------------------------------------------------------- overlaps
+def overlap_pairs(prs):
+    """Pairs of open PRs that change the same files, ignoring PRs in the same stack."""
+    sm = stack_map(prs)
+    def lineage(n):
+        info = sm.get(n)
+        if not info:
+            return {n}
+        out = {n, *info["below"]}
+        todo = list(info["children"])
+        while todo:
+            c = todo.pop(); out.add(c); todo += sm.get(c, {}).get("children", [])
+        return out
+    files = {p["number"]: {f["path"] for f in (p.get("files") or [])} for p in prs}
+    titles = {p["number"]: p["title"] for p in prs}
+    pairs = []
+    nums = sorted(files)
+    for i, x in enumerate(nums):
+        for y in nums[i + 1:]:
+            if y in lineage(x):
+                continue
+            shared = sorted(files[x] & files[y])
+            if shared:
+                pairs.append({"a": x, "b": y, "a_title": titles[x], "b_title": titles[y], "shared": shared})
+    return sorted(pairs, key=lambda p: -len(p["shared"]))
+
+
+def open_prs_with_files(repo):
+    return gh_json(["pr", "list", "-R", repo, "--state", "open", "--limit", "200", "--json",
+                    "number,title,body,headRefName,baseRefName,files"]) or []
+
+
+def cmd_overlaps(a):
+    pairs = overlap_pairs(open_prs_with_files(a.repo))
+    if a.number:
+        pairs = [p for p in pairs if a.number in (p["a"], p["b"])]
+    if not pairs:
+        print("No open PRs touch the same files."); return
+    for p in pairs:
+        more = f" (+{len(p['shared']) - 4} more)" if len(p["shared"]) > 4 else ""
+        print(f"#{p['a']} {p['a_title'][:40]}  <->  #{p['b']} {p['b_title'][:40]}\n    {', '.join(p['shared'][:4])}{more}")
 
 
 # ---------------------------------------------------------------- fetch
@@ -323,6 +452,26 @@ def cmd_fetch(a):
         stack = {**sm[n], "layers": layers}
         (work / "stack.json").write_text(json.dumps(stack, indent=2), encoding="utf-8")
 
+    # my unresolved review threads on this PR, so a re-review can check whether they were fixed
+    owner, name = repo.split("/", 1)
+    q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){"
+         "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
+         "comments(first:50){nodes{databaseId body createdAt author{login}}}}}}}}")
+    data = gh_json(["api", "graphql", "-f", f"query={q}", "-F", f"o={owner}", "-F", f"r={name}", "-F", f"n={n}"])
+    open_threads = []
+    for t in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+        cs = t["comments"]["nodes"]
+        if t["isResolved"] or not cs or (cs[0].get("author") or {}).get("login", "").lower() != login.lower():
+            continue
+        open_threads.append({"thread_id": t["id"], "reply_to": cs[0]["databaseId"], "path": t["path"], "line": t["line"],
+                             "outdated": t["isOutdated"], "label": label_of(cs[0]["body"]), "body": cs[0]["body"],
+                             "replies": [{"author": (c.get("author") or {}).get("login"), "body": c["body"]} for c in cs[1:]]})
+    (work / "my_open_threads.json").write_text(json.dumps(open_threads, indent=2), encoding="utf-8")
+
+    # other open PRs touching the same files (outside this PR's stack)
+    overlaps = [p for p in overlap_pairs(open_prs_with_files(repo)) if n in (p["a"], p["b"])]
+    (work / "overlaps.json").write_text(json.dumps(overlaps, indent=2), encoding="utf-8")
+
     # code at the PR head, in a worktree that is ours alone
     worktree = None
     incremental = None
@@ -350,7 +499,10 @@ def cmd_fetch(a):
         "pr": n, "title": pr["title"], "author": pr["author"]["login"], "head_sha": pr["headRefOid"],
         "own_pr": pr["author"]["login"].lower() == login.lower(),
         "work_dir": str(work), "worktree": worktree,
-        "files": {k: str(work / k) for k in ["pr.json", "diff.patch", "comments.json", "waiting.json", "issues.json"]},
+        "files": {k: str(work / k) for k in ["pr.json", "diff.patch", "comments.json", "waiting.json", "issues.json",
+                                              "my_open_threads.json", "overlaps.json"]},
+        "my_open_threads": len(open_threads),
+        "overlapping_prs": [p["b"] if p["a"] == n else p["a"] for p in overlaps],
         "incremental_patch": incremental,
         "previous_reviewed_sha": st.get("reviewed_sha"),
         "previous_draft": str(prev_draft) if prev_draft.exists() else None,
@@ -359,6 +511,61 @@ def cmd_fetch(a):
         "write_draft_to": str(draft_file(repo, n)),
     }, indent=2))
     save_state(repo, state)
+
+
+# ---------------------------------------------------------------- findings log
+def log_findings(repo, n, sha):
+    """Append this review's labelled comments to findings.jsonl, so trends can spot repeats."""
+    d = load_draft(repo, n)
+    if not d or d.get("head_sha") != sha or not d.get("review"):
+        return
+    f = home(repo) / "findings.jsonl"
+    seen = set()
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            try:
+                x = json.loads(line); seen.add((x["pr"], x["sha"], x["path"], x["line"]))
+            except (ValueError, KeyError):
+                pass
+    with f.open("a", encoding="utf-8") as out:
+        for c in d["review"].get("comments", []):
+            key = (n, sha, c.get("path"), c.get("line"))
+            if key in seen:
+                continue
+            first = re.split(r"(?<=[.?!])\s", re.sub(r"^\W+\s*", "", (c.get("body") or "").split("<details>")[0].strip()), maxsplit=1)[0]
+            out.write(json.dumps({"date": now(), "pr": n, "sha": sha, "path": c.get("path"), "line": c.get("line"),
+                                  "label": label_of(c.get("body")), "category": c.get("category", "other"),
+                                  "text": first[:200]}, ensure_ascii=False) + "\n")
+
+
+def cmd_trends(a):
+    f = home(a.repo) / "findings.jsonl"
+    if not f.exists():
+        print("No findings logged yet."); return
+    cutoff = datetime.now(timezone.utc).timestamp() - a.days * 86400
+    groups = {}
+    for line in f.read_text(encoding="utf-8").splitlines():
+        try:
+            x = json.loads(line)
+        except ValueError:
+            continue
+        if datetime.fromisoformat(x["date"]).timestamp() < cutoff or x.get("label") not in ("❌", "💡"):
+            continue
+        groups.setdefault(x["category"], []).append(x)
+    rows = []
+    for cat, xs in groups.items():
+        prs = sorted({x["pr"] for x in xs})
+        if len(prs) >= a.min_prs:
+            rows.append((len(prs), cat, xs, prs))
+    if not rows:
+        print(f"Nothing has repeated across {a.min_prs}+ PRs in the last {a.days} days."); return
+    print(f"Repeating findings, last {a.days} days (❌ and 💡 only)\n")
+    for count, cat, xs, prs in sorted(rows, reverse=True):
+        blocking = sum(1 for x in xs if x["label"] == "❌")
+        print(f"## {cat}: {count} PRs ({blocking} blocking)  " + " ".join(f"#{p}" for p in prs))
+        for x in xs[:5]:
+            print(f"  #{x['pr']} {x['path']}:{x['line']}  {x['label']} {x['text']}")
+        print()
 
 
 # ---------------------------------------------------------------- mark
@@ -370,6 +577,7 @@ def cmd_mark(a):
         diff = home(a.repo) / "work" / f"pr-{a.number}" / "diff.patch"
         if diff.exists():
             st["patch_id"] = patch_id(diff.read_text(encoding="utf-8"))
+        log_findings(a.repo, a.number, a.sha)
     seen = set(st.get("seen_comment_ids", []))
     seen.update(int(c) for c in a.comments or [])
     st["seen_comment_ids"] = sorted(seen)
@@ -513,8 +721,11 @@ def voice_problems(d):
     out += [f"{where} mentions the Merge Danger call (door, blast radius or rubberstampability stay local)"
             for where, t in texts if LEAK_RE.search(t or "")]
     for c in (r or {}).get("comments", []):
-        if not label_of(c.get("body")):
+        lab = label_of(c.get("body"))
+        if not lab:
             out.append(f"comment on {c.get('path')}:{c.get('line')} doesn't start with ❌ 💡 ❓ or ⛏️")
+        elif lab in ("❌", "💡") and c.get("category") not in CATEGORIES:
+            out.append(f"comment on {c.get('path')}:{c.get('line')} needs a category ({', '.join(sorted(CATEGORIES))})")
     return out
 
 
@@ -582,6 +793,18 @@ def thread_id_for(repo, n, root_comment_id):
     return None
 
 
+def resolve_threads(repo, d, done):
+    """Resolve review threads whose fix was verified (reply has resolve: true and was posted)."""
+    m = "mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{id}}}"
+    for x in d.get("replies", []):
+        if x.get("resolve") and x.get("thread_id") and x.get("posted") and not x.get("resolved"):
+            res = subprocess.run(["gh", "api", "graphql", "-f", f"query={m}", "-f", f"t={x['thread_id']}"],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if res.returncode == 0:
+                x["resolved"] = True
+                done.append(f"resolved thread on {x.get('path', 'the PR')}")
+
+
 def reconcile_staged(repo, n, d):
     """A staged draft's review lives on GitHub as PENDING until Jeremy submits or discards it."""
     rid = d.get("staged_review_id")
@@ -597,6 +820,7 @@ def reconcile_staged(repo, n, d):
             for x in d.get("replies", []):
                 if x.get("staged"):
                     x["posted"] = True
+            resolve_threads(repo, d, [])
             left = [x for x in d.get("replies", []) if not x.get("posted")]
             d["status"] = "pending" if left else "posted"
             if not left:
@@ -743,6 +967,7 @@ def post_one(repo, n, dry, only):
             what["posted"] = True
             done.append(f"reply to @{what.get('to', '?')} posted")
     if not dry:
+        resolve_threads(repo, d, done)
         review_ok = (not r or r.get("posted")) if d.get("status") != "staged" else d.get("review_submitted")
         replies_ok = all(x.get("posted") for x in d.get("replies", []))
         if review_ok and replies_ok:
@@ -782,16 +1007,38 @@ def cmd_digest(a):
         if d.get("status") == "staged":
             parts.append("on GitHub, not submitted")
         rows.append((asm.get("rubberstamp", 9), f"  #{d['pr']:<5} {d.get('title', '')[:48]:<48}  " + "  ·  ".join(parts)))
+    # Needs you now: low scores. Merge-ready: reviewed at the current head, 5/5, no ❌, CI green.
+    prs_now = gh_json(["pr", "list", "-R", a.repo, "--state", "open", "--limit", "200", "--json",
+                       "number,title,headRefOid,headRefName,baseRefName"]) or []
+    heads = {p["number"]: p["headRefOid"] for p in prs_now}
+    signals = pr_signals(a.repo)
+    urgent, ready = [], []
+    for f in (home(a.repo) / "drafts").glob("pr-*.json"):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        n, asm = d["pr"], d.get("assessment") or {}
+        if n not in heads or d.get("status") == "discarded" or not d.get("review"):
+            continue
+        blockers = sum(1 for c in d["review"].get("comments", []) if label_of(c.get("body")) == "❌")
+        current = d.get("head_sha") == heads[n]
+        if d.get("status") in ("pending", "staged") and isinstance(asm.get("rubberstamp"), int) and asm["rubberstamp"] <= 2:
+            urgent.append(f"  #{n:<5} {d.get('title', '')[:48]:<48}  {asm['rubberstamp']}/5  {asm.get('rubberstamp_reason', '')[:70]}")
+        if current and asm.get("rubberstamp") == 5 and not blockers and signals.get(n, {}).get("ci") == "passing":
+            ready.append(f"  #{n:<5} {d.get('title', '')[:48]}")
+    if urgent:
+        print("🚨 Needs you")
+        print("\n".join(sorted(urgent)) + "\n")
+    if ready:
+        print("✅ Merge-ready (5/5, no ❌, CI green, reviewed at current head)")
+        print("\n".join(sorted(ready)) + "\n")
     if not rows:
-        print("No pending drafts."); return
-    print("Pending drafts, riskiest first")
-    for _, line in sorted(rows):
-        print(line)
+        print("No pending drafts.")
+    else:
+        print("Pending drafts, riskiest first")
+        for _, line in sorted(rows):
+            print(line)
 
     # stacks: bottom to top, with the stack's worst door and lowest score
-    prs = gh_json(["pr", "list", "-R", a.repo, "--state", "open", "--limit", "200", "--json",
-                   "number,headRefName,baseRefName"]) or []
-    sm = stack_map(prs)
+    sm = stack_map(prs_now)
     tops = [n for n, i in sm.items() if not i["children"]]
     shown = set()
     for top in sorted(tops):
@@ -810,6 +1057,14 @@ def cmd_digest(a):
         if missing:
             bits.append(f"not scored: {', '.join(missing)}")
         print("Stack  " + "  ·  ".join(bits))
+
+    pairs = overlap_pairs(open_prs_with_files(a.repo))
+    if pairs:
+        print("\nOverlapping PRs (same files, different stacks)")
+        for p in pairs[:5]:
+            print(f"  #{p['a']} <-> #{p['b']}  {len(p['shared'])} shared: {', '.join(p['shared'][:3])}")
+        if len(pairs) > 5:
+            print(f"  ... {len(pairs) - 5} more, see overlaps")
 
 
 def cmd_report(a):
@@ -836,6 +1091,20 @@ def cmd_report(a):
         print("\n---\n")
 
 
+def cmd_config(a):
+    state = load_state(a.repo)
+    cfg = state.setdefault("config", {})
+    if a.key:
+        if a.key not in DEFAULTS:
+            sys.exit(f"unknown setting {a.key}; known: {', '.join(DEFAULTS)}")
+        if a.value is not None:
+            v = a.value
+            cfg[a.key] = int(v) if isinstance(DEFAULTS[a.key], int) and not isinstance(DEFAULTS[a.key], bool) \
+                else v.lower() in ("1", "true", "yes", "on") if isinstance(DEFAULTS[a.key], bool) else v
+            save_state(a.repo, state)
+    print(json.dumps(config(state), indent=2))
+
+
 def main():
     # Windows consoles and pipes default to a legacy code page; drafts carry emoji.
     for stream in (sys.stdout, sys.stderr):
@@ -846,6 +1115,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("scan"); s.add_argument("repo"); s.add_argument("--include-drafts", action="store_true"); s.add_argument("--include-bots", action="store_true"); s.add_argument("--include-own", action="store_true", help="also review PRs you opened")
+    s.add_argument("--pr", type=int, help="look at this one PR only; reviews it now even if CI is red or it was already reviewed")
     s = sub.add_parser("fetch"); s.add_argument("repo"); s.add_argument("number", type=int); s.add_argument("--no-checkout", action="store_true")
     s = sub.add_parser("mark"); s.add_argument("repo"); s.add_argument("number", type=int); s.add_argument("--sha"); s.add_argument("--comments", nargs="*")
     s = sub.add_parser("show"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
@@ -854,12 +1124,22 @@ def main():
     s = sub.add_parser("stage"); s.add_argument("repo"); s.add_argument("target", help="PR number, comma list, or 'all'")
     s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("report"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
+    s = sub.add_parser("overlaps"); s.add_argument("repo"); s.add_argument("number", type=int, nargs="?")
+    s = sub.add_parser("trends"); s.add_argument("repo"); s.add_argument("--days", type=int, default=30); s.add_argument("--min-prs", type=int, default=3)
+    s = sub.add_parser("config"); s.add_argument("repo"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?")
     s = sub.add_parser("path"); s.add_argument("repo")
     s = sub.add_parser("digest"); s.add_argument("repo")
     a = ap.parse_args()
+    a.repo, url_pr = parse_target(a.repo)
+    if url_pr:
+        if a.cmd == "scan":
+            a.pr = url_pr
+        elif hasattr(a, "number") and a.number is None:
+            a.number = url_pr
     if a.cmd == "path":
         print(home(a.repo)); return
-    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report}[a.cmd](a)
+    {"scan": cmd_scan, "fetch": cmd_fetch, "mark": cmd_mark, "show": cmd_show, "post": cmd_post, "digest": cmd_digest, "stage": cmd_stage, "report": cmd_report,
+     "overlaps": cmd_overlaps, "trends": cmd_trends, "config": cmd_config}[a.cmd](a)
 
 
 if __name__ == "__main__":

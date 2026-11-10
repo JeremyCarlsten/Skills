@@ -32,7 +32,7 @@ This uses the [`skills` CLI](https://github.com/vercel-labs/skills), the same in
 | Skill | Command | What it does |
 |---|---|---|
 | [review-outstanding](skills/review-outstanding/SKILL.md) | `/review-outstanding` | Reviews your uncommitted and unpushed changes for standards, spec, pattern breaks, refactoring (KISS, SRP), reuse and architecture, then offers to apply fixes. |
-| [review-prs](skills/review-prs/SKILL.md) | `/review-prs owner/repo` | Sweeps a repo's open PRs and drafts big-picture reviews (spec, architecture, security, one-way doors, agent-friendliness, tautological tests, performance) with a Merge Danger call, plus replies to comments in my voice. Drafts land on the PR as my private pending review; nothing is submitted until I approve. Built for `/loop`, stacked-PR aware. |
+| [review-prs](skills/review-prs/SKILL.md) | `/review-prs owner/repo` | Sweeps a repo's open PRs and drafts big-picture reviews (spec, architecture, security, one-way doors, agent-friendliness, tautological tests, performance) with a Merge Danger call, plus replies to comments in my voice. Drafts land on the PR as my private pending review; nothing is submitted until I approve. Built for `/loop` next to a Ralph loop: waits for CI and settled branches, flags merge-ready and risky PRs, checks fixes, spots overlapping PRs and repeating findings. Stacked-PR aware. |
 
 ### review-prs needs
 
@@ -50,6 +50,10 @@ Common commands:
 /review-prs owner/repo show             read the drafts
 /review-prs owner/repo stage 42         put a draft on GitHub as my pending review
 /review-prs owner/repo post 42          post one (or: post all)
+/review-prs owner/repo 567              review one PR now (or paste the PR URL)
+/review-prs owner/repo trends           findings that keep repeating, and factory fixes
+/review-prs owner/repo overlaps         open PRs touching the same files
+/review-prs owner/repo config settle_minutes 30
 ```
 
 ## Repo layout
